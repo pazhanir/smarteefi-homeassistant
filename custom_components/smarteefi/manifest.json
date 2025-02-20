@@ -1,0 +1,11 @@
+{
+  "domain": "smarteefi",
+  "name": "Smarteefi",
+  "version": "1.0.0",
+  "documentation": "https://github.com/coreembedded/smarteefi-homeassistant",
+  "requirements": [],
+  "dependencies": [],
+  "codeowners": ["@coreembedded"],
+  "config_flow": true,
+  "translations": "translations"
+}

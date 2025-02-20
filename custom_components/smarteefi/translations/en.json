@@ -1,0 +1,10 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Smarteefi Setup",
+        "description": "Enter your Smarteefi Home Assistant API Token\n\nYou may request home assistant api token from Smarteefi App Menu\nMenu->HomeAssistant"
+      }
+    }
+  }
+}

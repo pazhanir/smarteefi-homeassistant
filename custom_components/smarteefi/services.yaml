@@ -1,0 +1,2 @@
+discover_devices:
+  description: Discover devices from smarteefi account and sync with Home Assistant.
