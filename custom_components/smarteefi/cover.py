@@ -6,6 +6,7 @@ from homeassistant.components.cover import (
     CoverEntity,
     CoverEntityFeature,  # Use CoverEntityFeature instead of SUPPORT_* constants
 )
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from .const import DOMAIN, ARCH, OS
 
 _LOGGER = logging.getLogger(__name__)
@@ -63,6 +64,53 @@ class SmarteefiCover(CoverEntity):
         self.ip_address = ip_address
         self.netmask = netmask
         self._current_position = 0  # Assume the cover is fully closed initially
+        self._update_unsub = None
+        self._smap = None  # Store smap value from entity ID		
+
+        # Extract serial:smap from unique_id (format: "serial:ignored:smap")
+        parts = self._unique_id.split(':')
+        if len(parts) == 3:
+            self._entity_match_id = f"{parts[0]}:{parts[2]}"  # serial:smap
+            self._smap = int(parts[2])
+        else:
+            _LOGGER.error(f"Invalid unique_id format: {self._unique_id}")
+
+    async def async_added_to_hass(self):
+        """Register update dispatcher."""
+        if hasattr(self, '_entity_match_id'):
+            self._update_unsub = async_dispatcher_connect(
+                self.hass,
+                f"{DOMAIN}_device_update_{self._entity_match_id}",
+                self._handle_device_update
+            )
+
+    async def async_will_remove_from_hass(self):
+        """Unregister update dispatcher."""
+        if self._update_unsub:
+            self._update_unsub()
+
+    def _handle_device_update(self, data):
+        """Update state from UDP message."""
+        received_smap = data["smap"]
+        status = data["status"]
+        
+        # Only process if smap matches our entity's smap
+        if received_smap != self._smap:
+            return
+        
+        if status == self._smap:
+            self._state = "open"
+            self._current_position = 100
+        else:
+            self._state = "closed"
+            self._current_position = 0
+
+        self.schedule_update_ha_state()
+        _LOGGER.debug(
+            f"Updated cover {self._name} - "
+            f"State: {'Opened' if status else 'Closed'}, "
+            f"Current Position: {self._current_position}, Status: {status}"
+        )        
 
     @property
     def name(self):

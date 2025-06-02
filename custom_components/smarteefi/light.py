@@ -3,6 +3,7 @@ import os
 import asyncio
 
 from homeassistant.components.light import LightEntity, ColorMode, ATTR_BRIGHTNESS, ATTR_RGB_COLOR
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from .const import DOMAIN, ARCH, OS
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,8 +50,72 @@ class SmarteefiLight(LightEntity):
         self._cloud_id = device.get("cloudid", "")
         self._hacli = hacli_path
         self.ip_address = ip_address
-        self.netmask = netmask  
-    
+        self.netmask = netmask
+        self._update_unsub = None
+        self._smap = None  # Store smap value from entity ID
+
+        # Extract serial:smap from unique_id (format: "serial:ignored:smap")
+        parts = self._unique_id.split(':')
+        if len(parts) == 3:
+            self._entity_match_id = f"{parts[0]}:{parts[2]}"  # serial:smap
+            self._smap = int(parts[2])
+        else:
+            _LOGGER.error(f"Invalid unique_id format: {self._unique_id}")
+
+    async def async_added_to_hass(self):
+        """Register update dispatcher."""
+        if hasattr(self, '_entity_match_id'):
+            self._update_unsub = async_dispatcher_connect(
+                self.hass,
+                f"{DOMAIN}_device_update_{self._entity_match_id}",
+                self._handle_device_update
+            )
+
+    async def async_will_remove_from_hass(self):
+        """Unregister update dispatcher."""
+        if self._update_unsub:
+            self._update_unsub()
+
+    def _handle_device_update(self, data):
+        """Update state from UDP message."""
+        received_smap = data["smap"]
+        status = data["status"]
+        
+        # Only process if smap matches our entity's smap
+        if received_smap != self._smap:
+            return
+        
+        if status:
+            r = (status & 0xFF000000)>>24
+            g = (status & 0x00FF0000)>>16
+            b = (status & 0x0000FF00)>>8
+            self._brightness = int((max(r, g, b) / 255) * 255)  # Scale to 0-255
+            self._rgb_color = (r,g,b)
+            self._state = True
+        else:
+            self._state = False 
+            self._brightness = 0
+            self._rgb_color = (0, 0, 0)
+
+        self.schedule_update_ha_state() 
+        _LOGGER.debug(
+            f"Updated light {self._name} - "
+            f"State: {'on' if self._state else 'off'}, "
+            f"Brightness: {self._brightness}, Color: {self._rgb_color}"
+        )             
+            
+        # Your logic: ON if smap == status, OFF if status == 0
+        new_state = (status != 0) and (received_smap & status)
+        
+        if self._state != new_state:
+            self._state = new_state
+            self.schedule_update_ha_state()
+            _LOGGER.debug(
+                f"Updated switch {self._name} via UDP - "
+                f"State: {'on' if new_state else 'off'}, "
+                f"Smap: {received_smap}, Status: {status}"
+            )
+
     @property
     def name(self):
         """Return the name of the light."""
@@ -172,4 +237,29 @@ class SmarteefiLight(LightEntity):
             raise ValueError("Value must be between 0 and 255.")
     
         return round((value / 255) * 100)
+    
+    def rgb_to_brightness(self, r, g, b):
+        MAX_DUTY = 255
+
+        if r == 0 and g == 0 and b == 0:
+            return 0
+
+        if r == g == b:
+            return (100 * r / MAX_DUTY)
+        elif r == 0 and g == b:
+            return (100 * g / MAX_DUTY)
+        elif g == 0 and r == b:
+            return (100 * b / MAX_DUTY)
+        elif b == 0 and r == g:
+            return (100 * r / MAX_DUTY)
+        elif r == 0 and g == 0 and b != 0:
+            return (100 * b / MAX_DUTY)
+        elif g == 0 and b == 0 and r != 0:
+            return (100 * r / MAX_DUTY)
+        elif r == 0 and b == 0 and g != 0:
+            return (100 * g / MAX_DUTY)
+        else:
+            return (100 * max(r, g, b) / MAX_DUTY)
+
+
 

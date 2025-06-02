@@ -34,4 +34,8 @@ You can install the Smarteefi integration in Home Assistant through the **Home A
 
 
 ## Latest Updates  
-Follow us on **[X (formerly Twitter)](https://twitter.com/smarteefi)** for the latest product launches, new features, and additional entity support.  
+Follow us on **[X (formerly Twitter)](https://twitter.com/smarteefi)** for the latest product launches, new features, and additional entity support.
+
+Enhancement: 1.1
+1) For status updates. Polling method is added. It will poll status of all immediately HA restarts and every 5 minutes afterwards
+2) Provision also implemented for status update by devices themselves. Its for future use

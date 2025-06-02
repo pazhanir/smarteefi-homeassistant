@@ -6,6 +6,7 @@ import math
 from homeassistant.components.fan import FanEntity, FanEntityFeature
 from homeassistant.util.percentage import ranged_value_to_percentage, percentage_to_ranged_value
 from homeassistant.util.scaling import int_states_in_range
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from .const import DOMAIN, ARCH, OS
 
 SPEED_RANGE = (1, 4)
@@ -67,7 +68,71 @@ class SmarteefiFan(FanEntity):
         self._percentage = None
         self._speed_count = 4
         self._speed = 0
-     
+        self._update_unsub = None
+        self._smap = None  # Store smap value from entity ID
+
+        # Extract serial:smap from unique_id (format: "serial:ignored:smap")
+        parts = self._unique_id.split(':')
+        if len(parts) == 3:
+            self._entity_match_id = f"{parts[0]}:{parts[2]}"  # serial:smap
+            self._smap = int(parts[2])
+        else:
+            _LOGGER.error(f"Invalid unique_id format: {self._unique_id}")
+
+    async def async_added_to_hass(self):
+        """Register update dispatcher."""
+        if hasattr(self, '_entity_match_id'):
+            self._update_unsub = async_dispatcher_connect(
+                self.hass,
+                f"{DOMAIN}_device_update_{self._entity_match_id}",
+                self._handle_device_update
+            )
+
+    async def async_will_remove_from_hass(self):
+        """Unregister update dispatcher."""
+        if self._update_unsub:
+            self._update_unsub()
+
+    def _handle_device_update(self, data):
+        """Update state from UDP message."""
+        received_smap = data["smap"]
+        status = data["status"]
+        
+        # Only process if smap matches our entity's smap
+        if received_smap != self._smap:
+            return
+        
+        r1 = status & 0x10
+        r2 = status & 0x20
+        r3 = status & 0x40   
+
+        if r3:
+            self._percentage = 100
+            self._speed = 4
+        elif r2 and r1:
+            self._percentage = 75
+            self._speed = 3
+        elif r2:
+            self._percentage = 50
+            self._speed = 2
+        elif r1:
+            self._percentage = 25
+            self._speed = 1
+
+        if status == 0:
+            self._state = False
+            self._speed = 0
+            self._percentage = 0
+        else:
+            self._state = True
+
+        self.schedule_update_ha_state()
+        _LOGGER.debug(
+            f"Updated fan {self._name} - "
+            f"State: {'on' if self._state else 'off'}, "
+            f"Percentage: {self._percentage}, Speed: {self._speed}"
+        )        
+            
     @property
     def name(self):
         """Return the name of the fan."""
