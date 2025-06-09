@@ -53,6 +53,7 @@ class SmarteefiLight(LightEntity):
         self.netmask = netmask
         self._update_unsub = None
         self._smap = None  # Store smap value from entity ID
+        self._available = True
 
         # Extract serial:smap from unique_id (format: "serial:ignored:smap")
         parts = self._unique_id.split(':')
@@ -77,44 +78,39 @@ class SmarteefiLight(LightEntity):
             self._update_unsub()
 
     def _handle_device_update(self, data):
-        """Update state from UDP message."""
-        received_smap = data["smap"]
-        status = data["status"]
+        """Update state from dispatcher."""
+        self._available = data.get('available', True)
         
-        # Only process if smap matches our entity's smap
-        if received_smap != self._smap:
-            return
-        
-        if status:
-            r = (status & 0xFF000000)>>24
-            g = (status & 0x00FF0000)>>16
-            b = (status & 0x0000FF00)>>8
-            self._brightness = int((max(r, g, b) / 255) * 255)  # Scale to 0-255
-            self._rgb_color = (r,g,b)
-            self._state = True
-        else:
-            self._state = False 
-            self._brightness = 0
-            self._rgb_color = (0, 0, 0)
-
-        self.schedule_update_ha_state() 
-        _LOGGER.debug(
-            f"Updated light {self._name} - "
-            f"State: {'on' if self._state else 'off'}, "
-            f"Brightness: {self._brightness}, Color: {self._rgb_color}"
-        )             
-            
-        # Your logic: ON if smap == status, OFF if status == 0
-        new_state = (status != 0) and (received_smap & status)
-        
-        if self._state != new_state:
-            self._state = new_state
+        if not self._available:
             self.schedule_update_ha_state()
+            return
+
+        if "status" in data and "smap" in data:
+            received_smap = data["smap"]
+            status = data["status"]
+            
+            if received_smap != self._smap:
+                return
+            
+            if status:
+                r = (status & 0xFF000000) >> 24
+                g = (status & 0x00FF0000) >> 16
+                b = (status & 0x0000FF00) >> 8
+                self._brightness = int((max(r, g, b) / 255) * 255)
+                self._rgb_color = (r, g, b)
+                self._state = True
+            else:
+                self._state = False
+                self._brightness = 0
+                self._rgb_color = (0, 0, 0)
+
             _LOGGER.debug(
-                f"Updated switch {self._name} via UDP - "
-                f"State: {'on' if new_state else 'off'}, "
-                f"Smap: {received_smap}, Status: {status}"
+                f"Updated light {self._name} - "
+                f"State: {'on' if self._state else 'off'}, "
+                f"Brightness: {self._brightness}, Color: {self._rgb_color}"
             )
+        
+        self.schedule_update_ha_state()
 
     @property
     def name(self):
@@ -150,6 +146,11 @@ class SmarteefiLight(LightEntity):
     def color_mode(self):
         """Return the current color mode."""
         return ColorMode.RGB
+
+    @property
+    def available(self):
+        """Return True if the entity is available."""
+        return self._available
 
     async def _execute_cli(self, command):
         """Run the HACLI binary with the given command."""
@@ -260,6 +261,3 @@ class SmarteefiLight(LightEntity):
             return (100 * g / MAX_DUTY)
         else:
             return (100 * max(r, g, b) / MAX_DUTY)
-
-
-

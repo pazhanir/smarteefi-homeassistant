@@ -70,6 +70,7 @@ class SmarteefiFan(FanEntity):
         self._speed = 0
         self._update_unsub = None
         self._smap = None  # Store smap value from entity ID
+        self._available = True
 
         # Extract serial:smap from unique_id (format: "serial:ignored:smap")
         parts = self._unique_id.split(':')
@@ -94,44 +95,52 @@ class SmarteefiFan(FanEntity):
             self._update_unsub()
 
     def _handle_device_update(self, data):
-        """Update state from UDP message."""
-        received_smap = data["smap"]
-        status = data["status"]
+        """Update state from dispatcher."""
+        self._available = data.get('available', True)
         
-        # Only process if smap matches our entity's smap
-        if received_smap != self._smap:
+        if not self._available:
+            self.schedule_update_ha_state()
             return
+
+        if "status" in data and "smap" in data:
+            received_smap = data["smap"]
+            status = data["status"]
+            
+            # Only process if smap matches our entity's smap
+            if received_smap != self._smap:
+                return
+            
+            r1 = status & 0x10
+            r2 = status & 0x20
+            r3 = status & 0x40   
+
+            if r3:
+                self._percentage = 100
+                self._speed = 4
+            elif r2 and r1:
+                self._percentage = 75
+                self._speed = 3
+            elif r2:
+                self._percentage = 50
+                self._speed = 2
+            elif r1:
+                self._percentage = 25
+                self._speed = 1
+
+            if status == 0:
+                self._state = False
+                self._speed = 0
+                self._percentage = 0
+            else:
+                self._state = True
+            
+            _LOGGER.debug(
+                f"Updated fan {self._name} - "
+                f"State: {'on' if self._state else 'off'}, "
+                f"Percentage: {self._percentage}, Speed: {self._speed}"
+            )
         
-        r1 = status & 0x10
-        r2 = status & 0x20
-        r3 = status & 0x40   
-
-        if r3:
-            self._percentage = 100
-            self._speed = 4
-        elif r2 and r1:
-            self._percentage = 75
-            self._speed = 3
-        elif r2:
-            self._percentage = 50
-            self._speed = 2
-        elif r1:
-            self._percentage = 25
-            self._speed = 1
-
-        if status == 0:
-            self._state = False
-            self._speed = 0
-            self._percentage = 0
-        else:
-            self._state = True
-
         self.schedule_update_ha_state()
-        _LOGGER.debug(
-            f"Updated fan {self._name} - "
-            f"State: {'on' if self._state else 'off'}, "
-            f"Percentage: {self._percentage}, Speed: {self._speed}"
-        )        
             
     @property
     def name(self):
@@ -162,6 +171,11 @@ class SmarteefiFan(FanEntity):
     def speed_count(self) -> int:
         """Return the number of speeds the fan supports."""
         return int_states_in_range(SPEED_RANGE)
+    
+    @property
+    def available(self):
+        """Return True if the entity is available."""
+        return self._available
     
     async def _execute_cli(self, command):
         """Run the HACLI binary with the given command."""

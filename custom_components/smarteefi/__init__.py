@@ -129,7 +129,7 @@ class SmarteefiDataUpdateCoordinator:
             if entity_entry := entity_registry.async_get(entity_id):
                 device = next((d for d in devices if d["id"] == entity_entry.unique_id), None)
                 if device:
-                    await self._sync_device_state(device)
+                    await self._sync_device_state(device, devices)
         else:
             combined_devices = {}
 
@@ -151,8 +151,26 @@ class SmarteefiDataUpdateCoordinator:
                 await self._sync_device_state(device, devices)
                 await asyncio.sleep(1)  # Brief pause between devices
 
+    async def _execute_get_status_command(self, command):
+        """Executes the get-status CLI command and returns success, stdout, stderr."""
+        try:
+            process = await asyncio.create_subprocess_exec(
+                self._hacli_path, *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                return True, stdout.decode().strip(), None
+            else:
+                return False, None, stderr.decode().strip()
+        except Exception as e:
+            _LOGGER.error(f"Exception during get-status command: {e}")
+            return False, None, str(e)
+
     async def _sync_device_state(self, device, devices):
-        """Sync state for a single device."""
+        """Sync state for a single device with a retry mechanism."""
         command = [
             self.ip_address,
             self.netmask,
@@ -161,45 +179,43 @@ class SmarteefiDataUpdateCoordinator:
             str(device.get("cloudid", ""))
         ]
 
-        _LOGGER.debug(f"Syncing state for device {device['id']}")
+        _LOGGER.debug(f"Syncing state for device {device['id']} (attempt 1)")
+        success, output, error_msg = await self._execute_get_status_command(command)
 
-        try:
-            process = await asyncio.create_subprocess_exec(
-                self._hacli_path, *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
+        if not success:
+            _LOGGER.warning(f"State sync failed for {device['id']} on first attempt. Retrying...")
+            await asyncio.sleep(2) # Wait for 2 seconds before retrying
+            _LOGGER.debug(f"Syncing state for device {device['id']} (attempt 2)")
+            success, output, error_msg = await self._execute_get_status_command(command)
+            if not success:
+                _LOGGER.error(f"State sync failed for {device['id']} on second attempt. Marking as unavailable. Error: {error_msg}")
 
-            if process.returncode == 0:
-                output = stdout.decode().strip()
-                _LOGGER.debug(f"State sync successful for {device['id']}: {output}")
+        # Dispatch updates to all associated entities
+        parts = device["id"].split(':')
+        prefix = ':'.join(parts[:2])
+
+        for dev in devices:
+            dev_parts = dev['id'].split(':')
+            dev_prefix = ':'.join(dev_parts[:2])
+
+            if dev_prefix == prefix:
+                entity_match_id = f"{dev_parts[0]}:{dev_parts[2]}"
+                payload = {"available": success}
                 
-                try:
-                    status = int(output)
-                    parts = device["id"].split(':')
-                    prefix = ':'.join(parts[:2])
-
-                    if len(parts) == 3:
-                        for dev in devices:
-                            dev_parts = dev['id'].split(':')
-                            dev_prefix = ':'.join(dev_parts[:2])  # First two parts of device ID
-        
-                            # Check if prefixes match
-                            if dev_prefix == prefix:
-                                # Create var1 and var2
-                                entity_match_id = f"{dev_parts[0]}:{dev_parts[2]}"  # First part and third part
-                                async_dispatcher_send(
-                                    self.hass,
-                                    f"{DOMAIN}_device_update_{entity_match_id}",
-                                    {"smap": int(dev_parts[2]), "status": status}
-                                )
-                except ValueError:
-                    _LOGGER.error(f"Invalid status output for {device['id']}: {output}")
-            else:
-                _LOGGER.error(f"State sync failed for {device['id']}: {stderr.decode().strip()}")
-        except Exception as e:
-            _LOGGER.error(f"Error syncing state for {device['id']}: {e}")
+                if success:
+                    try:
+                        status = int(output)
+                        payload["smap"] = int(dev_parts[2])
+                        payload["status"] = status
+                    except (ValueError, TypeError):
+                        payload["available"] = False
+                        _LOGGER.error(f"Invalid status output for {device['id']}: {output}")
+                
+                async_dispatcher_send(
+                    self.hass,
+                    f"{DOMAIN}_device_update_{entity_match_id}",
+                    payload
+                )
 
     async def async_unload(self):
         """Unload the coordinator."""
@@ -266,7 +282,8 @@ async def start_udp_server(hass: HomeAssistant, ip_address: str, port: int):
                     f"{DOMAIN}_device_update_{entity_match_id}",
                     {
                         "smap": smap,
-                        "status": status
+                        "status": status,
+                        "available": True
                     }
                 )
                 
