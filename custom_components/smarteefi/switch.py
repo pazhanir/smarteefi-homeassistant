@@ -61,6 +61,7 @@ class SmarteefiSwitch(SwitchEntity):
         self.netmask = netmask
         self._update_unsub = None
         self._smap = None  # Store smap value from entity ID
+        self._attr_available = True
 
         # Extract serial:smap from unique_id (format: "serial:ignored:smap")
         parts = self._unique_id.split(':')
@@ -85,25 +86,36 @@ class SmarteefiSwitch(SwitchEntity):
             self._update_unsub()
 
     def _handle_device_update(self, data):
-        """Update state from UDP message."""
-        received_smap = data["smap"]
-        status = data["status"]
-        
-        # Only process if smap matches our entity's smap
-        if received_smap != self._smap:
-            return
+        """Update state from coordinator or UDP message."""
+        # Update availability if provided by the coordinator
+        if "available" in data:
+            self._attr_available = data["available"]
+
+        # Update state if status is provided (from coordinator or UDP)
+        if "status" in data:
+            # If a status update is received, the device is considered available.
+            self._attr_available = True
             
-        # Your logic: ON if smap == status, OFF if status == 0
-        new_state = (status != 0) and (received_smap & status)
+            received_smap = data["smap"]
+            status = data["status"]
+            
+            # Only process if smap matches our entity's smap
+            if received_smap != self._smap:
+                return
+            
+            # Logic: ON if relevant smap bit is set in status
+            new_state = (status & self._smap) != 0
+            
+            if self._state != new_state:
+                self._state = new_state
+                _LOGGER.debug(
+                    f"Updated switch {self._name} - "
+                    f"State: {'on' if new_state else 'off'}, "
+                    f"Smap: {received_smap}, Status: {status}"
+                )
         
-        if self._state != new_state:
-            self._state = new_state
-            self.schedule_update_ha_state()
-            _LOGGER.debug(
-                f"Updated switch {self._name} - "
-                f"State: {'on' if new_state else 'off'}, "
-                f"Smap: {received_smap}, Status: {status}"
-            )
+        # Schedule an update in Home Assistant
+        self.schedule_update_ha_state()
 
     @property
     def name(self):
