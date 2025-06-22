@@ -70,7 +70,7 @@ class SmarteefiFan(FanEntity):
         self._speed = 0
         self._update_unsub = None
         self._smap = None  # Store smap value from entity ID
-        self._available = True
+        self._attr_available = True
 
         # Extract serial:smap from unique_id (format: "serial:ignored:smap")
         parts = self._unique_id.split(':')
@@ -95,14 +95,16 @@ class SmarteefiFan(FanEntity):
             self._update_unsub()
 
     def _handle_device_update(self, data):
-        """Update state from dispatcher."""
-        self._available = data.get('available', True)
-        
-        if not self._available:
-            self.schedule_update_ha_state()
-            return
+        """Update state from coordinator or UDP message."""
+        # Update availability if provided by the coordinator
+        if "available" in data:
+            self._attr_available = data["available"]
 
-        if "status" in data and "smap" in data:
+        # Update state if status is provided (from coordinator or UDP)
+        if "status" in data:
+            # If a status update is received, the device is considered available.
+            self._attr_available = True
+            
             received_smap = data["smap"]
             status = data["status"]
             
@@ -133,14 +135,15 @@ class SmarteefiFan(FanEntity):
                 self._percentage = 0
             else:
                 self._state = True
-            
+
             _LOGGER.debug(
                 f"Updated fan {self._name} - "
                 f"State: {'on' if self._state else 'off'}, "
                 f"Percentage: {self._percentage}, Speed: {self._speed}"
             )
         
-        self.schedule_update_ha_state()
+        # Schedule an update in Home Assistant
+        self.schedule_update_ha_state()      
             
     @property
     def name(self):
@@ -171,11 +174,6 @@ class SmarteefiFan(FanEntity):
     def speed_count(self) -> int:
         """Return the number of speeds the fan supports."""
         return int_states_in_range(SPEED_RANGE)
-    
-    @property
-    def available(self):
-        """Return True if the entity is available."""
-        return self._available
     
     async def _execute_cli(self, command):
         """Run the HACLI binary with the given command."""
