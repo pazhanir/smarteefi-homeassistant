@@ -209,6 +209,19 @@ class SmarteefiDataUpdateCoordinator:
 
         # Final check after potential retry
         if error or (output and "device offline" in output.lower()):
+            # --- New Logic: Check ESP32 Webserver before marking unavailable ---
+            try:
+                session = async_get_clientsession(self.hass)
+                # Timeout set to 5 seconds
+                async with session.get("http://192.168.0.12", timeout=5) as response:
+                    if response.status == 200:
+                        _LOGGER.debug(f"Device {device['id']} CLI offline, but ESP32 Webserver (192.168.0.12) is reachable (200 OK). Ignoring offline status.")
+                        return  # Do nothing, exit function
+            except Exception as e:
+                # Includes asyncio.TimeoutError and aiohttp.ClientError
+                _LOGGER.debug(f"ESP32 Webserver check failed: {e}. Proceeding to mark device as unavailable.")
+            # -------------------------------------------------------------------
+
             _LOGGER.error(f"Device {device['id']} is offline after second attempt. Marking as unavailable. Error: {error or output}")
             dispatch_to_entities({"available": False})
         else:
