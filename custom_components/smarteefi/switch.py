@@ -87,6 +87,9 @@ class SmarteefiSwitch(SwitchEntity):
 
     def _handle_device_update(self, data):
         """Update state from coordinator or UDP message."""
+        _LOGGER.info(
+            f"[{self._name}] Received device update: {data}"
+        )
         # Update availability if provided by the coordinator
         if "available" in data:
             self._attr_available = data["available"]
@@ -105,6 +108,11 @@ class SmarteefiSwitch(SwitchEntity):
             
             # Logic: ON if relevant smap bit is set in status
             new_state = (status & self._smap) != 0
+            
+            _LOGGER.info(
+                f"[{self._name}] State update: current={self._state}, new={new_state}, "
+                f"smap={received_smap}, status={status}, status&smap={status & self._smap}"
+            )
             
             if self._state != new_state:
                 self._state = new_state
@@ -146,11 +154,19 @@ class SmarteefiSwitch(SwitchEntity):
             )
             stdout, stderr = await process.communicate()
 
+            stdout_str = stdout.decode().strip() if stdout else ""
+            stderr_str = stderr.decode().strip() if stderr else ""
+
+            _LOGGER.info(
+                f"CLI result for {self._name}: returncode={process.returncode}, "
+                f"stdout='{stdout_str}', stderr='{stderr_str}', "
+                f"command='{' '.join(full_command)}'"
+            )
+
             if process.returncode == 0:
-                _LOGGER.debug(f"Command succeeded: {' '.join(full_command)}, Output: {stdout.decode().strip()}")
                 return True
             else:
-                _LOGGER.error(f"Command failed: {' '.join(full_command)}, Error: {stderr.decode().strip()}")
+                _LOGGER.error(f"Command failed: {' '.join(full_command)}, Error: {stderr_str}")
                 return False
         except FileNotFoundError:
             _LOGGER.error(f"CLI binary not found at {self._hacli}")
@@ -161,14 +177,20 @@ class SmarteefiSwitch(SwitchEntity):
 
     async def async_turn_on(self, **kwargs):
         """Turn the switch on."""
-        _LOGGER.info("Turning on Smarteefi switch: %s", self._name)
+        _LOGGER.info(
+            "Turning on Smarteefi switch: %s (unique_id=%s, cloud_id='%s', ip=%s, netmask=%s)",
+            self._name, self._unique_id, self._cloud_id, self.ip_address, self.netmask
+        )
         if await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "1"]):
             self._state = True
             self.schedule_update_ha_state()
 
     async def async_turn_off(self, **kwargs):
         """Turn the switch off."""
-        _LOGGER.info("Turning off Smarteefi switch: %s", self._name)
+        _LOGGER.info(
+            "Turning off Smarteefi switch: %s (unique_id=%s, cloud_id='%s', ip=%s, netmask=%s)",
+            self._name, self._unique_id, self._cloud_id, self.ip_address, self.netmask
+        )
         if await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "0"]):
             self._state = False
             self.schedule_update_ha_state()

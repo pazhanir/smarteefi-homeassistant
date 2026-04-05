@@ -152,6 +152,7 @@ class SmarteefiDataUpdateCoordinator:
     async def _execute_get_status(self, command):
         """Execute the get-status command and return the output and error."""
         try:
+            _LOGGER.info(f"Executing get-status CLI: {self._hacli_path} {' '.join(command)}")
             process = await asyncio.create_subprocess_exec(
                 self._hacli_path, *command,
                 stdout=asyncio.subprocess.PIPE,
@@ -159,10 +160,19 @@ class SmarteefiDataUpdateCoordinator:
             )
             stdout, stderr = await process.communicate()
             
+            stdout_str = stdout.decode().strip() if stdout else ""
+            stderr_str = stderr.decode().strip() if stderr else ""
+            
+            _LOGGER.info(
+                f"get-status CLI result: returncode={process.returncode}, "
+                f"stdout='{stdout_str}', stderr='{stderr_str}', "
+                f"command='{' '.join(command)}'"
+            )
+            
             if process.returncode == 0:
-                return stdout.decode().strip(), None  # output, error
+                return stdout_str, None  # output, error
             else:
-                return None, stderr.decode().strip()  # output, error
+                return None, stderr_str  # output, error
                 
         except Exception as e:
             _LOGGER.error(f"Exception during get-status command: {e}")
@@ -170,13 +180,19 @@ class SmarteefiDataUpdateCoordinator:
 
     async def _sync_device_state(self, device, devices):
         """Sync state for a single device, with a retry on failure."""
+        cloudid_value = str(device.get("cloudid", ""))
         command = [
             self.ip_address,
             self.netmask,
             "get-status",
             device["id"],
-            str(device.get("cloudid", ""))
+            cloudid_value
         ]
+
+        _LOGGER.info(
+            f"Syncing state for device {device['id']} with cloudid='{cloudid_value}' "
+            f"(ip={self.ip_address}, netmask={self.netmask})"
+        )
 
         # First attempt
         _LOGGER.debug(f"Syncing state for device {device['id']} (Attempt 1)")
