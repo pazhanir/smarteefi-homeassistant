@@ -64,6 +64,10 @@ class SmarteefiCoordinator(DataUpdateCoordinator):
         self.broadcast_addr = broadcast_addr
         self._is_initial_sync = True
 
+        # ESP32 fallback settings from config entry
+        self._fallback_enabled = entry.data.get("fallback_enabled", False)
+        self._fallback_ip = entry.data.get("fallback_ip", "")
+
         # Build module map: serial -> combined switchmap for get-status
         self._modules: dict[str, int] = {}
         for device in entry.data.get("devices", []):
@@ -76,9 +80,11 @@ class SmarteefiCoordinator(DataUpdateCoordinator):
                 self._modules[serial] = smap
 
         _LOGGER.debug(
-            "Coordinator init: broadcast=%s, modules=%s",
+            "Coordinator init: broadcast=%s, modules=%s, fallback=%s (ip=%s)",
             broadcast_addr,
             {s: f"0x{m:X}" for s, m in self._modules.items()},
+            self._fallback_enabled,
+            self._fallback_ip,
         )
 
     async def _async_update_data(self) -> dict:
@@ -125,31 +131,36 @@ class SmarteefiCoordinator(DataUpdateCoordinator):
                     "available": True,
                 }
             else:
-                # Both attempts failed — ESP32 fallback check
-                esp32_reachable = await self._check_esp32_fallback()
-                if esp32_reachable:
-                    _LOGGER.debug(
-                        "Device %s UDP offline, but ESP32 (192.168.0.12) reachable. "
-                        "Keeping previous state.",
-                        serial,
-                    )
-                    # Keep whatever was in data[serial] before (don't overwrite)
-                    continue
+                # Both attempts failed — ESP32 fallback check (if enabled)
+                if self._fallback_enabled and self._fallback_ip:
+                    esp32_reachable = await self._check_esp32_fallback()
+                    if esp32_reachable:
+                        _LOGGER.debug(
+                            "Device %s UDP offline, but ESP32 (%s) reachable. "
+                            "Keeping previous state.",
+                            serial,
+                            self._fallback_ip,
+                        )
+                        # Keep whatever was in data[serial] before (don't overwrite)
+                        continue
 
                 _LOGGER.error(
-                    "Device %s offline after retry + ESP32 check. Marking unavailable.",
+                    "Device %s offline after retry%s. Marking unavailable.",
                     serial,
+                    " + ESP32 check" if self._fallback_enabled else "",
                 )
                 data[serial] = {**data.get(serial, {}), "available": False}
 
         return data
 
     async def _check_esp32_fallback(self) -> bool:
-        """Check if ESP32 webserver at 192.168.0.12 is reachable."""
+        """Check if ESP32 webserver is reachable at the configured fallback IP."""
+        if not self._fallback_ip:
+            return False
         try:
             session = async_get_clientsession(self.hass)
             async with asyncio.timeout(5):
-                async with session.get("http://192.168.0.12") as response:
+                async with session.get(f"http://{self._fallback_ip}") as response:
                     return response.status == 200
         except Exception:
             return False

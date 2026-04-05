@@ -12,6 +12,14 @@
       "devices": {
         "title": "Select Device Types",
         "description": "Select the type for each discovered device. Found {device_count} device(s)."
+      },
+      "fallback": {
+        "title": "Redundancy Polling (Optional)",
+        "description": "If you have an ESP32 webserver on your network, enable fallback to prevent devices from being marked unavailable when UDP is temporarily unreachable.",
+        "data": {
+          "fallback_enabled": "Enable ESP32 fallback check",
+          "fallback_ip": "ESP32 IP address (e.g. 192.168.0.12)"
+        }
       }
     },
     "error": {
@@ -33,6 +41,14 @@
       "devices": {
         "title": "Select Device Types",
         "description": "Select the type for each discovered device"
+      },
+      "fallback": {
+        "title": "Redundancy Polling (Optional)",
+        "description": "If you have an ESP32 webserver on your network, enable fallback to prevent devices from being marked unavailable when UDP is temporarily unreachable.",
+        "data": {
+          "fallback_enabled": "Enable ESP32 fallback check",
+          "fallback_ip": "ESP32 IP address (e.g. 192.168.0.12)"
+        }
       }
     },
     "error": {

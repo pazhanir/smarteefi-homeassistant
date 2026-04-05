@@ -74,18 +74,8 @@ class SmarteefiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         })
                         break
 
-            return self.async_create_entry(
-                title=DOMAIN,
-                data={
-                    "email": self._data["email"],
-                    "password": self._data["password"],
-                    "access_token": self._data["access_token"],
-                    "network_interface": "",
-                    "ip_address": "",
-                    "netmask": "",
-                    "devices": devices,
-                },
-            )
+            self._data["devices"] = devices
+            return await self.async_step_fallback()
 
         # Fetch devices from v3 API
         result = await self._api_fetch_devices(self._data["access_token"])
@@ -133,6 +123,35 @@ class SmarteefiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={
                 "device_count": str(len(switches)),
             },
+        )
+
+    async def async_step_fallback(self, user_input=None):
+        """Step 3: Optional redundancy polling (ESP32 fallback check)."""
+        if user_input is not None:
+            fallback_enabled = user_input.get("fallback_enabled", False)
+            fallback_ip = user_input.get("fallback_ip", "").strip()
+
+            return self.async_create_entry(
+                title=DOMAIN,
+                data={
+                    "email": self._data["email"],
+                    "password": self._data["password"],
+                    "access_token": self._data["access_token"],
+                    "network_interface": "",
+                    "ip_address": "",
+                    "netmask": "",
+                    "devices": self._data["devices"],
+                    "fallback_enabled": fallback_enabled,
+                    "fallback_ip": fallback_ip if fallback_enabled else "",
+                },
+            )
+
+        return self.async_show_form(
+            step_id="fallback",
+            data_schema=vol.Schema({
+                vol.Required("fallback_enabled", default=False): bool,
+                vol.Optional("fallback_ip", default=""): str,
+            }),
         )
 
     async def _api_login(self, email, password):
@@ -249,19 +268,8 @@ class SmarteefiOptionsFlowHandler(config_entries.OptionsFlow):
                         })
                         break
 
-            # Update config entry with new credentials and devices
-            self.hass.config_entries.async_update_entry(
-                self.config_entry,
-                data={
-                    **self.config_entry.data,
-                    "email": self._data["email"],
-                    "password": self._data["password"],
-                    "access_token": self._data["access_token"],
-                    "devices": devices,
-                },
-            )
-
-            return self.async_create_entry(title="", data={})
+            self._data["devices"] = devices
+            return await self.async_step_fallback()
 
         # Fetch devices from v3 API
         result = await self._api_fetch_devices(self._data["access_token"])
@@ -310,6 +318,39 @@ class SmarteefiOptionsFlowHandler(config_entries.OptionsFlow):
             step_id="devices",
             data_schema=vol.Schema(schema_dict),
             errors=errors,
+        )
+
+    async def async_step_fallback(self, user_input=None):
+        """Step 3: Optional redundancy polling (ESP32 fallback check)."""
+        if user_input is not None:
+            fallback_enabled = user_input.get("fallback_enabled", False)
+            fallback_ip = user_input.get("fallback_ip", "").strip()
+
+            # Update config entry with new credentials, devices, and fallback
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                data={
+                    **self.config_entry.data,
+                    "email": self._data["email"],
+                    "password": self._data["password"],
+                    "access_token": self._data["access_token"],
+                    "devices": self._data["devices"],
+                    "fallback_enabled": fallback_enabled,
+                    "fallback_ip": fallback_ip if fallback_enabled else "",
+                },
+            )
+
+            return self.async_create_entry(title="", data={})
+
+        current_fallback = self.config_entry.data.get("fallback_enabled", False)
+        current_ip = self.config_entry.data.get("fallback_ip", "")
+
+        return self.async_show_form(
+            step_id="fallback",
+            data_schema=vol.Schema({
+                vol.Required("fallback_enabled", default=current_fallback): bool,
+                vol.Optional("fallback_ip", default=current_ip): str,
+            }),
         )
 
     async def _api_login(self, email, password):
