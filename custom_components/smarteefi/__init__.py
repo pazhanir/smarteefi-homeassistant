@@ -12,7 +12,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
-from .const import DOMAIN, ARCH, OS, SYNC_INTERVAL, INITIAL_SYNC_INTERVAL, API_LOGIN_URL, API_DEVICES_URL
+from .const import DOMAIN, ARCH, OS, SYNC_INTERVAL, INITIAL_SYNC_INTERVAL, API_LOGIN_URL, API_DEVICES_URL, generate_cloudid
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -364,6 +364,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         data={**entry.data, "network_interface": network_interface, "ip_address": ip_address, "netmask": netmask}
     )
 
+    # Migrate existing devices: regenerate cloudid for any device with empty or missing cloudid.
+    # This ensures devices from older config entries (before cloudid generation was added) get
+    # valid cloudids so that set-* CLI commands pass the subscription check.
+    devices = entry.data.get("devices", [])
+    needs_migration = any(not d.get("cloudid") for d in devices)
+    if needs_migration:
+        _LOGGER.info("Migrating devices: generating cloudid values for %d device(s)", len(devices))
+        migrated_devices = []
+        for d in devices:
+            if not d.get("cloudid"):
+                d = {**d, "cloudid": generate_cloudid(d["id"])}
+            migrated_devices.append(d)
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, "devices": migrated_devices}
+        )
+
     # Start UDP server
     udp_port = 8890  # Default port
     udp_transport = await start_udp_server(hass, ip_address, udp_port)
@@ -480,7 +497,7 @@ async def fetch_devices(session: aiohttp.ClientSession, access_token: str):
                 "id": device_id,
                 "type": "switch",  # Default type; config_flow lets user override
                 "name": sw.get("name", sw["serial"]),
-                "cloudid": "",
+                "cloudid": generate_cloudid(device_id),
             })
         return devices
 
