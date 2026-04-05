@@ -3,7 +3,7 @@ import aiohttp
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
-from .const import DOMAIN, API_LOGIN_URL, API_DEVICES_URL, generate_cloudid
+from .const import DOMAIN, API_LOGIN_URL, API_DEVICES_URL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -71,7 +71,6 @@ class SmarteefiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             "id": device_id,
                             "type": device_type,
                             "name": raw["name"],
-                            "cloudid": generate_cloudid(device_id),
                         })
                         break
 
@@ -247,7 +246,6 @@ class SmarteefiOptionsFlowHandler(config_entries.OptionsFlow):
                             "id": device_id,
                             "type": device_type,
                             "name": raw["name"],
-                            "cloudid": generate_cloudid(device_id),
                         })
                         break
 

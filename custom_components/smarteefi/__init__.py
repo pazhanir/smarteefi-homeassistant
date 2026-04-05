@@ -1,475 +1,362 @@
+"""Smarteefi integration — pure Python UDP control with HA DataUpdateCoordinator."""
+
 import logging
-import aiohttp
-import psutil
-import socket
-import os
-import stat
 import asyncio
+import socket
 from datetime import timedelta
+
+import aiohttp
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.event import async_track_time_interval
-from .const import DOMAIN, ARCH, OS, SYNC_INTERVAL, INITIAL_SYNC_INTERVAL, API_LOGIN_URL, API_DEVICES_URL, generate_cloudid
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+
+from .const import DOMAIN, SYNC_INTERVAL, INITIAL_SYNC_INTERVAL, API_LOGIN_URL, API_DEVICES_URL
+from . import udp_protocol
 
 _LOGGER = logging.getLogger(__name__)
 
+PLATFORMS = ["switch", "fan", "light", "cover"]
+
+
 async def async_setup(hass: HomeAssistant, config: dict):
     """Set up the Smarteefi integration."""
-    _LOGGER.debug("Setting up Smarteefi integration")
     hass.data.setdefault(DOMAIN, {})
-
-    # Get correct integration path
-    INTEGRATION_PATH = hass.config.path(f"custom_components/smarteefi")
-    
-    # Full path to HACLI binary
-    if(OS=='win'):
-        HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli.exe")
-    else:
-        HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli")
-    
-    set_executable_permissions(HACLI)
-    _LOGGER.debug(f"Using HACLI path: {HACLI}")    
 
     async def handle_refresh_devices(call):
         """Handle the service call to refresh devices."""
-        entry = hass.config_entries.async_entries(DOMAIN)[0]
-        await async_refresh_devices(hass, entry)
+        entries = hass.config_entries.async_entries(DOMAIN)
+        if entries:
+            await async_refresh_devices(hass, entries[0])
 
     async def handle_sync_states(call):
         """Handle the service call to sync states."""
-        entry = hass.config_entries.async_entries(DOMAIN)[0]
-        coordinator = hass.data[DOMAIN].get("coordinator")
+        coordinator = hass.data.get(DOMAIN, {}).get("coordinator")
         if coordinator:
-            await coordinator._async_update()
+            await coordinator.async_request_refresh()
 
     hass.services.async_register(DOMAIN, "discover_devices", handle_refresh_devices)
     hass.services.async_register(DOMAIN, "sync_states", handle_sync_states)
     return True
 
-class SmarteefiDataUpdateCoordinator:
-    """Class to manage fetching Smarteefi data with non-blocking startup."""
 
-    def __init__(self, hass, entry):
-        """Initialize."""
-        self.hass = hass
-        self.entry = entry
-        self._unsub_interval = None
-        self._unsub_init = None  # For the initial delayed update
-        self._listeners = []
-        self._hacli_path = None
-        self._is_initial_sync = True
-        self.ip_address = entry.data.get("ip_address")
-        self.netmask = entry.data.get("netmask")
-        self._is_initial_load = True  # Track initial load state
+# ---------------------------------------------------------------------------
+# DataUpdateCoordinator — hybrid polling + push
+# ---------------------------------------------------------------------------
 
-    async def async_init(self):
-        """Initialize the coordinator without blocking startup."""
-        # Get correct integration path
-        INTEGRATION_PATH = self.hass.config.path(f"custom_components/smarteefi")
-        
-        # Full path to HACLI binary
-        if(OS=='win'):
-            self._hacli_path = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli.exe")
-        else:
-            self._hacli_path = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli")
-        
-        set_executable_permissions(self._hacli_path)
-        _LOGGER.debug(f"Using HACLI path: {self._hacli_path}")
+class SmarteefiCoordinator(DataUpdateCoordinator):
+    """Smarteefi data update coordinator.
 
-        # Track initial sync state
-        self._is_initial_sync = True
-    
-        # Start with initial sync interval
-        self._setup_interval(INITIAL_SYNC_INTERVAL)
+    Polls all modules via UDP get-status on an interval (5s initially, then 15s).
+    Push updates from port 8890 are merged in via async_set_updated_data().
+    """
 
-    def _setup_interval(self, interval_seconds):
-        """Setup or update the sync interval."""
-        # Remove previous interval if exists
-        if self._unsub_interval:
-            self._unsub_interval()
-    
-        # Set up new interval
-        self._unsub_interval = async_track_time_interval(
-            self.hass, 
-            self._async_update, 
-            timedelta(seconds=interval_seconds)
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, broadcast_addr: str):
+        """Initialize the coordinator."""
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_interval=timedelta(seconds=INITIAL_SYNC_INTERVAL),
         )
-        _LOGGER.debug(f"Set sync interval to {interval_seconds} seconds")
+        self.entry = entry
+        self.broadcast_addr = broadcast_addr
+        self._is_initial_sync = True
 
-    async def _async_update(self, now=None):
+        # Build module map: serial -> combined switchmap for get-status
+        self._modules: dict[str, int] = {}
+        for device in entry.data.get("devices", []):
+            parts = device["id"].split(":")
+            serial = parts[0]
+            smap = int(parts[2])
+            if serial in self._modules:
+                self._modules[serial] |= smap
+            else:
+                self._modules[serial] = smap
 
-        if not self.hass.is_running:
-            _LOGGER.debug("HA Not Yet Ready. Wait to load")
-            return
+        _LOGGER.debug(
+            "Coordinator init: broadcast=%s, modules=%s",
+            broadcast_addr,
+            {s: f"0x{m:X}" for s, m in self._modules.items()},
+        )
 
-        # If this was the initial sync, switch to regular interval
+    async def _async_update_data(self) -> dict:
+        """Poll all modules via UDP get-status with retry + ESP32 fallback."""
+
+        # Switch from initial fast interval to regular interval after first poll
         if self._is_initial_sync:
             self._is_initial_sync = False
-            self._setup_interval(SYNC_INTERVAL)        
-           
-        _LOGGER.debug("Performing periodic state sync for all Smarteefi devices")
-        await self.async_sync_states()
-                
+            self.update_interval = timedelta(seconds=SYNC_INTERVAL)
+            _LOGGER.debug("Switching to regular sync interval (%ds)", SYNC_INTERVAL)
 
-    async def async_sync_states(self, entity_id=None):
-        """Sync states for all devices or a specific entity."""
-        devices = self.entry.data.get("devices", [])
-        if not devices:
-            _LOGGER.debug("No devices to sync")
+        data: dict = dict(self.data) if self.data else {}
+
+        for serial, combined_switchmap in self._modules.items():
+            _LOGGER.debug("Polling %s (switchmap=0x%X)", serial, combined_switchmap)
+
+            # --- First attempt ---
+            resp = await udp_protocol.async_get_status(
+                serial, self.broadcast_addr, combined_switchmap
+            )
+
+            if resp is None or resp.get("result") != 1:
+                _LOGGER.warning(
+                    "Device %s offline on first attempt, retrying in 5s...", serial
+                )
+                await asyncio.sleep(5)
+
+                # --- Second attempt ---
+                resp = await udp_protocol.async_get_status(
+                    serial, self.broadcast_addr, combined_switchmap
+                )
+
+            if resp is not None and resp.get("result") == 1:
+                # Success
+                _LOGGER.debug(
+                    "Device %s OK: switchmap=0x%X, statusmap=0x%X",
+                    serial,
+                    resp.get("switchmap", 0),
+                    resp.get("statusmap", 0),
+                )
+                data[serial] = {
+                    "statusmap": resp.get("statusmap", 0),
+                    "switchmap": resp.get("switchmap", 0),
+                    "available": True,
+                }
+            else:
+                # Both attempts failed — ESP32 fallback check
+                esp32_reachable = await self._check_esp32_fallback()
+                if esp32_reachable:
+                    _LOGGER.debug(
+                        "Device %s UDP offline, but ESP32 (192.168.0.12) reachable. "
+                        "Keeping previous state.",
+                        serial,
+                    )
+                    # Keep whatever was in data[serial] before (don't overwrite)
+                    continue
+
+                _LOGGER.error(
+                    "Device %s offline after retry + ESP32 check. Marking unavailable.",
+                    serial,
+                )
+                data[serial] = {**data.get(serial, {}), "available": False}
+
+        return data
+
+    async def _check_esp32_fallback(self) -> bool:
+        """Check if ESP32 webserver at 192.168.0.12 is reachable."""
+        try:
+            session = async_get_clientsession(self.hass)
+            async with asyncio.timeout(5):
+                async with session.get("http://192.168.0.12") as response:
+                    return response.status == 200
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Push listener on port 8890
+# ---------------------------------------------------------------------------
+
+class SmarteefiPushProtocol(asyncio.DatagramProtocol):
+    """UDP listener on port 8890 for device push updates."""
+
+    def __init__(self, coordinator: SmarteefiCoordinator):
+        """Initialize the push listener."""
+        self.coordinator = coordinator
+        self.transport = None
+
+    def connection_made(self, transport):
+        """Configure the socket when connection is made."""
+        self.transport = transport
+        sock = transport.get_extra_info("socket")
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except (AttributeError, OSError):
+                pass  # Not available on all platforms
+            _LOGGER.debug("Push listener socket configured on port %d", udp_protocol.PUSH_PORT)
+        except Exception as e:
+            _LOGGER.error("Error configuring push listener socket: %s", e)
+
+    def datagram_received(self, data, addr):
+        """Handle incoming push updates from devices."""
+        _LOGGER.debug("Push update from %s (%d bytes): %s", addr, len(data), data.hex())
+
+        parsed = None
+
+        # Try standard 66-byte response format first (0xAAAA preamble)
+        if len(data) >= 58 and data[0:2] == b"\xaa\xaa":
+            resp = udp_protocol.parse_response(data)
+            if resp and resp.get("serial"):
+                parsed = {
+                    "serial": resp["serial"],
+                    "statusmap": resp.get("statusmap", 0),
+                    "switchmap": resp.get("switchmap", 0),
+                }
+
+        # Try 26-byte push update format
+        if parsed is None:
+            push = udp_protocol.parse_push_update(data)
+            if push:
+                parsed = {
+                    "serial": push["serial"],
+                    "statusmap": push["status"],
+                    "switchmap": push.get("switchmap", 0),
+                }
+
+        if parsed is None:
+            _LOGGER.warning("Could not parse push update from %s (%d bytes)", addr, len(data))
             return
 
-        if entity_id:
-            # Sync only the specified entity
-            entity_registry = er.async_get(self.hass)
-            if entity_entry := entity_registry.async_get(entity_id):
-                device = next((d for d in devices if d["id"] == entity_entry.unique_id), None)
-                if device:
-                    await self._sync_device_state(device)
-        else:
-            combined_devices = {}
-
-            for device in devices:
-                parts = device["id"].split(':')
-                prefix = ':'.join(parts[:2])  # First two parts as key
-                value = int(parts[2])         # Third part as integer
-    
-                if prefix in combined_devices:
-                    combined_devices[prefix] |= value
-                else:
-                    combined_devices[prefix] = value
-
-            # Create the new list of devices with combined IDs
-            new_devices = [{"id": f"{prefix}:{value}"} for prefix, value in combined_devices.items()]
-
-            for index, device in enumerate(new_devices, 1):
-                _LOGGER.debug(f"Processing device {index} of {len(new_devices)}")
-                await self._sync_device_state(device, devices)
-                await asyncio.sleep(1)  # Brief pause between devices
-
-    async def _execute_get_status(self, command):
-        """Execute the get-status command and return the output and error."""
-        try:
-            _LOGGER.info(f"Executing get-status CLI: {self._hacli_path} {' '.join(command)}")
-            process = await asyncio.create_subprocess_exec(
-                self._hacli_path, *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            stdout_str = stdout.decode().strip() if stdout else ""
-            stderr_str = stderr.decode().strip() if stderr else ""
-            
-            _LOGGER.info(
-                f"get-status CLI result: returncode={process.returncode}, "
-                f"stdout='{stdout_str}', stderr='{stderr_str}', "
-                f"command='{' '.join(command)}'"
-            )
-            
-            if process.returncode == 0:
-                return stdout_str, None  # output, error
-            else:
-                return None, stderr_str  # output, error
-                
-        except Exception as e:
-            _LOGGER.error(f"Exception during get-status command: {e}")
-            return None, str(e)
-
-    async def _sync_device_state(self, device, devices):
-        """Sync state for a single device, with a retry on failure."""
-        cloudid_value = str(device.get("cloudid", ""))
-        command = [
-            self.ip_address,
-            self.netmask,
-            "get-status",
-            device["id"],
-            cloudid_value
-        ]
-
+        serial = parsed["serial"]
         _LOGGER.info(
-            f"Syncing state for device {device['id']} with cloudid='{cloudid_value}' "
-            f"(ip={self.ip_address}, netmask={self.netmask})"
+            "Push update for %s: statusmap=0x%X, switchmap=0x%X",
+            serial,
+            parsed["statusmap"],
+            parsed.get("switchmap", 0),
         )
 
-        # First attempt
-        _LOGGER.debug(f"Syncing state for device {device['id']} (Attempt 1)")
-        output, error = await self._execute_get_status(command)
-        
-        # Check if the first attempt failed
-        if error or (output and "device offline" in output.lower()):
-            _LOGGER.warning(f"Device {device['id']} appears offline on first attempt. Retrying in 5 seconds...")
-            await asyncio.sleep(5)  # Wait before retrying
-            
-            # Second attempt
-            _LOGGER.debug(f"Syncing state for device {device['id']} (Attempt 2)")
-            output, error = await self._execute_get_status(command)
+        # Merge into coordinator data and notify all entities
+        current_data = dict(self.coordinator.data) if self.coordinator.data else {}
+        current_data[serial] = {
+            "statusmap": parsed["statusmap"],
+            "switchmap": parsed.get(
+                "switchmap",
+                current_data.get(serial, {}).get("switchmap", 0),
+            ),
+            "available": True,
+        }
+        self.coordinator.async_set_updated_data(current_data)
 
-        # Helper to dispatch updates to all entities of a physical device
-        def dispatch_to_entities(payload):
-            parts = device["id"].split(':')
-            prefix = ':'.join(parts[:2])
-            for dev in devices:
-                dev_parts = dev['id'].split(':')
-                if ':'.join(dev_parts[:2]) == prefix:
-                    entity_match_id = f"{dev_parts[0]}:{dev_parts[2]}"
-                    async_dispatcher_send(
-                        self.hass,
-                        f"{DOMAIN}_device_update_{entity_match_id}",
-                        payload
-                    )
 
-        # Final check after potential retry
-        if error or (output and "device offline" in output.lower()):
-            # --- New Logic: Check ESP32 Webserver before marking unavailable ---
-            try:
-                session = async_get_clientsession(self.hass)
-                # Timeout set to 5 seconds
-                async with session.get("http://192.168.0.12", timeout=5) as response:
-                    if response.status == 200:
-                        _LOGGER.debug(f"Device {device['id']} CLI offline, but ESP32 Webserver (192.168.0.12) is reachable (200 OK). Ignoring offline status.")
-                        return  # Do nothing, exit function
-            except Exception as e:
-                # Includes asyncio.TimeoutError and aiohttp.ClientError
-                _LOGGER.debug(f"ESP32 Webserver check failed: {e}. Proceeding to mark device as unavailable.")
-            # -------------------------------------------------------------------
-
-            _LOGGER.error(f"Device {device['id']} is offline after second attempt. Marking as unavailable. Error: {error or output}")
-            dispatch_to_entities({"available": False})
-        else:
-            _LOGGER.debug(f"State sync successful for {device['id']}: {output}")
-            try:
-                status = int(output)
-                # Dispatch status and availability to all entities of this device
-                prefix = ':'.join(device["id"].split(':')[:2])
-                for dev in devices:
-                    dev_parts = dev['id'].split(':')
-                    if ':'.join(dev_parts[:2]) == prefix:
-                        entity_smap = int(dev_parts[2])
-                        entity_match_id = f"{dev_parts[0]}:{entity_smap}"
-                        async_dispatcher_send(
-                            self.hass,
-                            f"{DOMAIN}_device_update_{entity_match_id}",
-                            {"smap": entity_smap, "status": status, "available": True}
-                        )
-            except (ValueError, TypeError):  # Catches int conversion errors or if output is None
-                _LOGGER.error(f"Invalid status output for {device['id']} after sync: {output}. Marking as unavailable.")
-                dispatch_to_entities({"available": False})
-
-    async def async_unload(self):
-        """Unload the coordinator."""
-        if self._unsub_init:
-            self._unsub_init.cancel()
-        if self._unsub_interval:
-            self._unsub_interval()
-            self._unsub_interval = None
-
-async def start_udp_server(hass: HomeAssistant, ip_address: str, port: int):
-    """Start UDP server to listen for device updates."""
-    loop = asyncio.get_event_loop()
-    
-    class SmarteefiUDPProtocol:
-        def __init__(self):
-            self.transport = None
-            
-        def connection_made(self, transport):
-            self.transport = transport
-            sock = transport.get_extra_info('socket')
-            try:
-                # Enable broadcast and reuse address
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                if os.name != 'nt':  # Not available on Windows
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-                _LOGGER.debug("UDP socket configured for broadcast")
-            except Exception as e:
-                _LOGGER.error(f"Error configuring socket: {e}")
-            
-        def datagram_received(self, data, addr):
-            """Handle incoming UDP packets with custom binary format."""
-            try:
-                _LOGGER.debug(f"Received UDP packet from {addr}: {data.hex()}")
-                
-                # Verify minimum packet length (26 bytes)
-                if len(data) < 26:
-                    _LOGGER.error(f"Packet too short: {len(data)} bytes")
-                    return
-                
-                # Parse serial number (first 16 bytes, null-terminated)
-                serial_bytes = data[:16]
-                serial = serial_bytes.split(b'\x00')[0].decode('ascii')
-                
-                # Verify separators
-                if data[16] != ord(':') or data[21] != ord(':'):
-                    _LOGGER.error("Invalid packet format - missing separators")
-                    return
-                
-                # Parse smap (4 bytes little-endian)
-                smap = int.from_bytes(data[17:21], byteorder='little', signed=False)
-                
-                # Parse status (4 bytes little-endian)
-                status = int.from_bytes(data[22:26], byteorder='little', signed=False)
-                
-                _LOGGER.debug(f"Parsed packet - Serial: {serial}, Smap: {smap}, Status: {status}")
-                
-                # Create the entity matching pattern (serial:smap)
-                entity_match_id = f"{serial}:{smap}"
-                
-                # Signal all platforms to update
-                async_dispatcher_send(
-                    hass,
-                    f"{DOMAIN}_device_update_{entity_match_id}",
-                    {
-                        "smap": smap,
-                        "status": status
-                    }
-                )
-                
-            except Exception as e:
-                _LOGGER.error(f"Error processing UDP packet: {e}")
-
-    try:
-        transport, protocol = await loop.create_datagram_endpoint(
-            lambda: SmarteefiUDPProtocol(),
-            local_addr=('0.0.0.0', port))
-        
-        _LOGGER.info(f"Started UDP server on {ip_address}:{port}")
-        return transport
-    except Exception as e:
-        _LOGGER.error(f"Failed to start UDP server: {e}")
-        return None
+# ---------------------------------------------------------------------------
+# Entry setup / unload
+# ---------------------------------------------------------------------------
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up Smarteefi integration from a config entry."""
     hass.data.setdefault(DOMAIN, {})
-    access_token = entry.data.get("access_token")
 
+    access_token = entry.data.get("access_token")
     if not access_token:
         _LOGGER.error("Access token is missing in config entry")
         return False
 
-    # Auto-detect the active interface, IP address, and netmask
-    network_interface, ip_address, netmask = _get_active_interface_ip_and_netmask()
-    if not network_interface or not ip_address or not netmask:
-        _LOGGER.error("Unable to determine active network interface, IP address, or netmask")
+    # Auto-detect network interface, IP, and netmask
+    network_interface, ip_address, netmask = _detect_network()
+    if not ip_address or not netmask:
+        _LOGGER.error("Unable to determine IP address or netmask")
         return False
 
-    _LOGGER.debug(f"Detected active interface: {network_interface}, IP: {ip_address}, Netmask: {netmask}")
-
-    # Update the config entry with the latest interface details
-    hass.config_entries.async_update_entry(
-        entry,
-        data={**entry.data, "network_interface": network_interface, "ip_address": ip_address, "netmask": netmask}
+    _LOGGER.debug(
+        "Detected interface: %s, IP: %s, Netmask: %s",
+        network_interface, ip_address, netmask,
     )
 
-    # Migrate existing devices: regenerate cloudid for any device with empty or missing cloudid.
-    # This ensures devices from older config entries (before cloudid generation was added) get
-    # valid cloudids so that set-* CLI commands pass the subscription check.
-    devices = entry.data.get("devices", [])
-    needs_migration = any(not d.get("cloudid") for d in devices)
-    if needs_migration:
-        _LOGGER.info("Migrating devices: generating cloudid values for %d device(s)", len(devices))
-        migrated_devices = []
-        for d in devices:
-            if not d.get("cloudid"):
-                d = {**d, "cloudid": generate_cloudid(d["id"])}
-            migrated_devices.append(d)
-        hass.config_entries.async_update_entry(
-            entry,
-            data={**entry.data, "devices": migrated_devices}
+    # Store network info in config entry for reference
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            "network_interface": network_interface,
+            "ip_address": ip_address,
+            "netmask": netmask,
+        },
+    )
+
+    broadcast_addr = udp_protocol.compute_broadcast_addr(ip_address, netmask)
+    _LOGGER.info("Broadcast address: %s", broadcast_addr)
+
+    # Create the coordinator
+    coordinator = SmarteefiCoordinator(hass, entry, broadcast_addr)
+
+    # Start push listener on port 8890
+    push_transport = None
+    try:
+        loop = asyncio.get_running_loop()
+        push_transport, _ = await loop.create_datagram_endpoint(
+            lambda: SmarteefiPushProtocol(coordinator),
+            local_addr=("0.0.0.0", udp_protocol.PUSH_PORT),
+        )
+        _LOGGER.info("Push listener started on port %d", udp_protocol.PUSH_PORT)
+    except Exception as e:
+        _LOGGER.warning(
+            "Failed to start push listener on port %d: %s. "
+            "Continuing without real-time push updates.",
+            udp_protocol.PUSH_PORT,
+            e,
         )
 
-    # Start UDP server
-    udp_port = 8890  # Default port
-    udp_transport = await start_udp_server(hass, ip_address, udp_port)
-    if udp_transport is None:
-        _LOGGER.warning("UDP server failed to start, continuing without real-time updates")
+    # Do first data refresh (blocks briefly but ensures entities have data)
+    await coordinator.async_refresh()
 
-    hass.data[DOMAIN]["udp_transport"] = udp_transport
-
-    # Initialize data coordinator
-    coordinator = SmarteefiDataUpdateCoordinator(hass, entry)
-    await coordinator.async_init()
+    # Store coordinator and transport in hass.data
     hass.data[DOMAIN]["coordinator"] = coordinator
+    hass.data[DOMAIN]["push_transport"] = push_transport
 
-    session = async_get_clientsession(hass)
-
-    # Check if devices are already loaded in config_entry (they should be from config_flow)
-    if "devices" not in entry.data:
-        try:
-            _LOGGER.debug("Fetching devices using access token")
-            devices = await fetch_devices(session, access_token)
-            _LOGGER.debug("Devices fetched successfully: %s", devices)
-
-            # Update config_entry with fetched devices
-            hass.config_entries.async_update_entry(
-                entry,
-                data={**entry.data, "devices": devices}
-            )
-
-            _LOGGER.info("Smarteefi devices discovered: %s", devices)
-
-            # Forward setup to all platforms at once
-            await hass.config_entries.async_forward_entry_setups(entry, ["switch", "fan", "light", "cover"])
-
-        except Exception as e:
-            _LOGGER.error("Error fetching Smarteefi devices: %s", e)
-            return False
-    else:
-        # Devices are already in config_entry from config flow, no need to fetch
-        await hass.config_entries.async_forward_entry_setups(entry, ["switch", "fan", "light", "cover"])
+    # Forward setup to all entity platforms
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    if "udp_transport" in hass.data[DOMAIN] and hass.data[DOMAIN]["udp_transport"]:
-        hass.data[DOMAIN]["udp_transport"].close()
-        _LOGGER.info("Stopped UDP server")
-    
-    if "coordinator" in hass.data[DOMAIN]:
-        coordinator = hass.data[DOMAIN]["coordinator"]
-        await coordinator.async_unload()
-    
-    # Unload all platforms
-    await hass.config_entries.async_forward_entry_unload(entry, ["switch", "fan", "light", "cover"])
-    return True
+    # Close push listener
+    push_transport = hass.data[DOMAIN].get("push_transport")
+    if push_transport:
+        push_transport.close()
+        _LOGGER.info("Push listener stopped")
 
-def _get_interface_ip_and_netmask(interface):
-    """Get the IP address and netmask for the specified interface."""
-    try:
-        addrs = psutil.net_if_addrs().get(interface, [])
-        for addr in addrs:
-            if addr.family == socket.AF_INET:
-                return addr.address, addr.netmask
-        _LOGGER.warning(f"No IPv4 address found for interface: {interface}")
-        return None, None
-    except Exception as e:
-        _LOGGER.error(f"Error retrieving IP address and netmask for interface {interface}: {e}")
-        return None, None
+    # Unload all entity platforms
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-def _get_active_interface_ip_and_netmask():
-    """Determine the active interface with the default gateway and return its name, IP, and netmask."""
+    if unload_ok:
+        hass.data[DOMAIN].pop("coordinator", None)
+        hass.data[DOMAIN].pop("push_transport", None)
+
+    return unload_ok
+
+
+# ---------------------------------------------------------------------------
+# Network detection
+# ---------------------------------------------------------------------------
+
+def _detect_network():
+    """Detect the active network interface, IP address, and netmask."""
     try:
+        # Get local IP via socket trick (connects to Google DNS, doesn't send data)
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
             local_ip = s.getsockname()[0]
 
-        interfaces = psutil.net_if_addrs()
-        for iface, addrs in interfaces.items():
-            if iface in ['lo', 'lo0']:
-                continue
-            for addr in addrs:
-                if addr.family == socket.AF_INET and addr.address == local_ip:
-                    return iface, addr.address, addr.netmask
+        # Try psutil for interface name and netmask (available in HA environment)
+        try:
+            import psutil
+            for iface, addrs in psutil.net_if_addrs().items():
+                if iface in ("lo", "lo0"):
+                    continue
+                for addr in addrs:
+                    if addr.family == socket.AF_INET and addr.address == local_ip:
+                        return iface, addr.address, addr.netmask
+        except ImportError:
+            _LOGGER.debug("psutil not available, using fallback netmask")
 
-        _LOGGER.warning("No active interface found matching the default gateway IP.")
-        return None, None, None
+        # Fallback: assume /24 subnet (covers most home networks)
+        return "unknown", local_ip, "255.255.255.0"
+
     except Exception as e:
-        _LOGGER.error(f"Error determining active interface: {e}")
+        _LOGGER.error("Error detecting network: %s", e)
         return None, None, None
+
+
+# ---------------------------------------------------------------------------
+# Device fetching / refresh (v3 REST API)
+# ---------------------------------------------------------------------------
 
 async def fetch_devices(session: aiohttp.ClientSession, access_token: str):
     """Fetch devices from Smarteefi v3 API and transform to existing format."""
@@ -480,7 +367,11 @@ async def fetch_devices(session: aiohttp.ClientSession, access_token: str):
         response_text = await response.text()
 
         if response.status != 200:
-            _LOGGER.error("Failed to fetch devices, status: %s, response: %s", response.status, response_text)
+            _LOGGER.error(
+                "Failed to fetch devices, status: %s, response: %s",
+                response.status,
+                response_text,
+            )
             return []
 
         json_response = await response.json()
@@ -488,7 +379,7 @@ async def fetch_devices(session: aiohttp.ClientSession, access_token: str):
             _LOGGER.error("API returned failure: %s", json_response)
             return []
 
-        # Transform v3 switches[] to existing device format
+        # Transform v3 switches[] to device format
         switches = json_response.get("switches", [])
         devices = []
         for sw in switches:
@@ -497,9 +388,9 @@ async def fetch_devices(session: aiohttp.ClientSession, access_token: str):
                 "id": device_id,
                 "type": "switch",  # Default type; config_flow lets user override
                 "name": sw.get("name", sw["serial"]),
-                "cloudid": generate_cloudid(device_id),
             })
         return devices
+
 
 async def async_refresh_devices(hass: HomeAssistant, entry: ConfigEntry):
     """Refresh devices from Smarteefi v3 API, with re-login if token is stale."""
@@ -523,52 +414,46 @@ async def async_refresh_devices(hass: HomeAssistant, entry: ConfigEntry):
                 new_token = await _api_relogin(session, email, password)
                 if new_token:
                     access_token = new_token
-                    # Update token in config entry
                     hass.config_entries.async_update_entry(
                         entry,
-                        data={**entry.data, "access_token": access_token}
+                        data={**entry.data, "access_token": access_token},
                     )
                     devices = await fetch_devices(session, access_token)
 
-        _LOGGER.debug("Devices refreshed successfully: %s", devices)
-
-        # Get the current devices from the config entry
-        current_devices = entry.data.get("devices", [])
-        current_device_ids = {device['id'] for device in current_devices}
-        new_device_ids = {device['id'] for device in devices}
+        _LOGGER.debug("Devices refreshed: %s", devices)
 
         # Preserve user-selected types for existing devices
+        current_devices = entry.data.get("devices", [])
         current_type_map = {d["id"]: d["type"] for d in current_devices}
         for device in devices:
             if device["id"] in current_type_map:
                 device["type"] = current_type_map[device["id"]]
 
-        # Identify removed and added devices
+        # Identify removed devices
+        current_device_ids = {d["id"] for d in current_devices}
+        new_device_ids = {d["id"] for d in devices}
         removed_device_ids = current_device_ids - new_device_ids
-        added_device_ids = new_device_ids - current_device_ids
 
-        # Update config_entry with refreshed devices
+        # Update config entry with refreshed devices
         hass.config_entries.async_update_entry(
             entry,
-            data={**entry.data, "devices": devices}
+            data={**entry.data, "devices": devices},
         )
 
-        # Remove entities for devices that are no longer present
+        # Remove entities for devices no longer present
         entity_registry = er.async_get(hass)
-        entities_to_remove = [
-            entity_entry.entity_id
-            for entity_entry in entity_registry.entities.values()
-            if entity_entry.config_entry_id == entry.entry_id and entity_entry.unique_id in removed_device_ids
-        ]
-
-        for entity_id in entities_to_remove:
-            entity_registry.async_remove(entity_id)
+        for entity_entry in entity_registry.entities.values():
+            if (
+                entity_entry.config_entry_id == entry.entry_id
+                and entity_entry.unique_id in removed_device_ids
+            ):
+                entity_registry.async_remove(entity_entry.entity_id)
 
         _LOGGER.info("Smarteefi devices refreshed: %s", devices)
 
-        # Reload platforms to reflect new devices
-        await hass.config_entries.async_forward_entry_unload(entry, ["switch", "fan", "light", "cover"])
-        await hass.config_entries.async_forward_entry_setups(entry, ["switch", "fan", "light", "cover"])
+        # Reload platforms to reflect changes
+        await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     except Exception as e:
         _LOGGER.error("Error refreshing Smarteefi devices: %s", e)
@@ -576,13 +461,9 @@ async def async_refresh_devices(hass: HomeAssistant, entry: ConfigEntry):
 
 
 async def _api_relogin(session: aiohttp.ClientSession, email: str, password: str):
-    """Re-login to Smarteefi v3 API and return new access_token, or None on failure."""
+    """Re-login to Smarteefi v3 API and return new access_token, or None."""
     payload = {
-        "LoginForm": {
-            "email": email,
-            "password": password,
-            "app": "smarteefi",
-        }
+        "LoginForm": {"email": email, "password": password, "app": "smarteefi"}
     }
     headers = {"Content-Type": "application/json"}
 
@@ -593,18 +474,9 @@ async def _api_relogin(session: aiohttp.ClientSession, email: str, password: str
                 if data.get("result") == "success":
                     _LOGGER.info("Re-login successful, new access token obtained")
                     return data.get("access_token")
-                else:
-                    _LOGGER.error("Re-login failed: %s", data)
+                _LOGGER.error("Re-login failed: %s", data)
             else:
                 _LOGGER.error("Re-login API returned status %s", response.status)
     except Exception as e:
         _LOGGER.error("Exception during re-login: %s", e)
     return None
-
-def set_executable_permissions(file_path: str) -> None:
-    """Set executable permissions on the specified file."""
-    if os.path.exists(file_path):
-        current_perms = os.stat(file_path).st_mode
-        os.chmod(file_path, current_perms | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    else:
-        _LOGGER.error(f"CLI not found at {file_path}")

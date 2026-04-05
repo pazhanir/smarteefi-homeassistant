@@ -1,129 +1,46 @@
+"""Smarteefi switch platform — CoordinatorEntity + pure UDP control."""
+
 import logging
-import os
-import asyncio
+
 from homeassistant.components.switch import SwitchEntity
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from .const import DOMAIN, ARCH, OS
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from .const import DOMAIN
+from . import udp_protocol
 
 _LOGGER = logging.getLogger(__name__)
 
-_LOGGER.info(f"Domain is {DOMAIN}")
 
 async def async_setup_entry(hass, entry, async_add_entities):
     """Set up Smarteefi switches from a config entry."""
-    
-    # Get correct integration path
-    INTEGRATION_PATH = hass.config.path(f"custom_components/smarteefi")
-    
-    # Full path to HACLI binary
-    if(OS=='win'):
-        HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli.exe")
-    else:
-        HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli")
-    
-    _LOGGER.debug(f"Using HACLI path: {HACLI}")
-
+    coordinator = hass.data[DOMAIN]["coordinator"]
     devices = entry.data.get("devices", [])
 
-    if not devices:
-        _LOGGER.error("No devices found for Smarteefi switch.")
-        return
-    
-    # Get host ip address from config_entry
-    ip_address = entry.data.get("ip_address")
+    switches = [
+        SmarteefiSwitch(coordinator, device)
+        for device in devices
+        if device["type"] == "switch"
+    ]
 
-    if not ip_address:
-        _LOGGER.error("ip_address not found in config entry!")
-        return
+    if switches:
+        async_add_entities(switches)
+        _LOGGER.debug("Added %d Smarteefi switch entities", len(switches))
 
-    # Get host ip address from config_entry
-    netmask = entry.data.get("netmask")
 
-    if not netmask:
-        _LOGGER.error("netmask not found in config entry!")
-        return            
+class SmarteefiSwitch(CoordinatorEntity, SwitchEntity):
+    """Representation of a Smarteefi switch channel."""
 
-    # Pass network_interface to SmarteefiSwitch constructor
-    switches = [SmarteefiSwitch(device, HACLI, ip_address, netmask) for device in devices if device["type"] == "switch"]
-    async_add_entities(switches, True)
-
-class SmarteefiSwitch(SwitchEntity):
-    """Representation of a Smarteefi switch."""
-
-    def __init__(self, device, hacli_path, ip_address, netmask):
+    def __init__(self, coordinator, device):
+        """Initialize the switch."""
+        super().__init__(coordinator)
         self._device = device
-        self._state = False
         self._name = device.get("name", "Unnamed Switch")
-        self._unique_id = device.get("id", "")  # Format: "serial:ignored:smap"
-        self._cloud_id = device.get("cloudid", "")
-        self._hacli = hacli_path
-        self.ip_address = ip_address
-        self.netmask = netmask
-        self._update_unsub = None
-        self._smap = None  # Store smap value from entity ID
-        self._attr_available = True
+        self._unique_id = device["id"]
 
-        # Extract serial:smap from unique_id (format: "serial:ignored:smap")
-        parts = self._unique_id.split(':')
-        if len(parts) == 3:
-            self._entity_match_id = f"{parts[0]}:{parts[2]}"  # serial:smap
-            self._smap = int(parts[2])
-        else:
-            _LOGGER.error(f"Invalid unique_id format: {self._unique_id}")
-
-    async def async_added_to_hass(self):
-        """Register update dispatcher."""
-        if hasattr(self, '_entity_match_id'):
-            self._update_unsub = async_dispatcher_connect(
-                self.hass,
-                f"{DOMAIN}_device_update_{self._entity_match_id}",
-                self._handle_device_update
-            )
-
-    async def async_will_remove_from_hass(self):
-        """Unregister update dispatcher."""
-        if self._update_unsub:
-            self._update_unsub()
-
-    def _handle_device_update(self, data):
-        """Update state from coordinator or UDP message."""
-        _LOGGER.info(
-            f"[{self._name}] Received device update: {data}"
-        )
-        # Update availability if provided by the coordinator
-        if "available" in data:
-            self._attr_available = data["available"]
-
-        # Update state if status is provided (from coordinator or UDP)
-        if "status" in data:
-            # If a status update is received, the device is considered available.
-            self._attr_available = True
-            
-            received_smap = data["smap"]
-            status = data["status"]
-            
-            # Only process if smap matches our entity's smap
-            if received_smap != self._smap:
-                return
-            
-            # Logic: ON if relevant smap bit is set in status
-            new_state = (status & self._smap) != 0
-            
-            _LOGGER.info(
-                f"[{self._name}] State update: current={self._state}, new={new_state}, "
-                f"smap={received_smap}, status={status}, status&smap={status & self._smap}"
-            )
-            
-            if self._state != new_state:
-                self._state = new_state
-                _LOGGER.debug(
-                    f"Updated switch {self._name} - "
-                    f"State: {'on' if new_state else 'off'}, "
-                    f"Smap: {received_smap}, Status: {status}"
-                )
-        
-        # Schedule an update in Home Assistant
-        self.schedule_update_ha_state()
+        # Extract serial and smap from device ID (format: "serial:group_id:smap")
+        parts = self._unique_id.split(":")
+        self._serial = parts[0]
+        self._smap = int(parts[2])
 
     @property
     def name(self):
@@ -132,65 +49,64 @@ class SmarteefiSwitch(SwitchEntity):
 
     @property
     def unique_id(self):
-        """Return a unique ID for the switch."""
+        """Return the unique ID of the switch."""
         return self._unique_id
 
     @property
+    def available(self):
+        """Return True if the device module is available."""
+        if not self.coordinator.data:
+            return False
+        module = self.coordinator.data.get(self._serial)
+        if module is None:
+            return False
+        return module.get("available", False)
+
+    @property
     def is_on(self):
-        """Return True if the switch is on."""
-        return self._state
-
-    async def _execute_cli(self, command):
-        """Run the HACLI binary with the given command."""
-        full_command = [self._hacli] + command
-
-        _LOGGER.debug(f"Executing CLI command: {' '.join(full_command)}")
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                self._hacli, *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-
-            stdout_str = stdout.decode().strip() if stdout else ""
-            stderr_str = stderr.decode().strip() if stderr else ""
-
-            _LOGGER.info(
-                f"CLI result for {self._name}: returncode={process.returncode}, "
-                f"stdout='{stdout_str}', stderr='{stderr_str}', "
-                f"command='{' '.join(full_command)}'"
-            )
-
-            if process.returncode == 0:
-                return True
-            else:
-                _LOGGER.error(f"Command failed: {' '.join(full_command)}, Error: {stderr_str}")
-                return False
-        except FileNotFoundError:
-            _LOGGER.error(f"CLI binary not found at {self._hacli}")
+        """Return True if the switch channel is on."""
+        if not self.coordinator.data:
             return False
-        except Exception as e:
-            _LOGGER.error(f"Error executing CLI: {e}")
-            return False
+        module = self.coordinator.data.get(self._serial, {})
+        statusmap = module.get("statusmap", 0)
+        return (statusmap & self._smap) != 0
 
     async def async_turn_on(self, **kwargs):
-        """Turn the switch on."""
+        """Turn the switch on via UDP."""
         _LOGGER.info(
-            "Turning on Smarteefi switch: %s (unique_id=%s, cloud_id='%s', ip=%s, netmask=%s)",
-            self._name, self._unique_id, self._cloud_id, self.ip_address, self.netmask
+            "Turning ON switch %s (serial=%s, smap=%d)",
+            self._name, self._serial, self._smap,
         )
-        if await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "1"]):
-            self._state = True
-            self.schedule_update_ha_state()
+        resp = await udp_protocol.async_set_status(
+            self._serial, self.coordinator.broadcast_addr, self._smap, True
+        )
+        if resp and resp.get("result") == 1:
+            self._update_coordinator_from_response(resp)
+        else:
+            _LOGGER.warning("set-status ON failed for %s, scheduling refresh", self._name)
+            await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs):
-        """Turn the switch off."""
+        """Turn the switch off via UDP."""
         _LOGGER.info(
-            "Turning off Smarteefi switch: %s (unique_id=%s, cloud_id='%s', ip=%s, netmask=%s)",
-            self._name, self._unique_id, self._cloud_id, self.ip_address, self.netmask
+            "Turning OFF switch %s (serial=%s, smap=%d)",
+            self._name, self._serial, self._smap,
         )
-        if await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "0"]):
-            self._state = False
-            self.schedule_update_ha_state()
+        resp = await udp_protocol.async_set_status(
+            self._serial, self.coordinator.broadcast_addr, self._smap, False
+        )
+        if resp and resp.get("result") == 1:
+            self._update_coordinator_from_response(resp)
+        else:
+            _LOGGER.warning("set-status OFF failed for %s, scheduling refresh", self._name)
+            await self.coordinator.async_request_refresh()
+
+    def _update_coordinator_from_response(self, resp):
+        """Merge a UDP command response into coordinator data."""
+        new_data = dict(self.coordinator.data) if self.coordinator.data else {}
+        module = dict(new_data.get(self._serial, {}))
+        module["statusmap"] = resp.get("statusmap", module.get("statusmap", 0))
+        module["switchmap"] = resp.get("switchmap", module.get("switchmap", 0))
+        module["available"] = True
+        new_data[self._serial] = module
+        self.coordinator.async_set_updated_data(new_data)
