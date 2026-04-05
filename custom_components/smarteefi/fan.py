@@ -122,6 +122,7 @@ class SmarteefiFan(CoordinatorEntity, FanEntity):
         """Turn the fan on via UDP, serialized per module."""
         lock = self.coordinator.get_serial_lock(self._serial)
         async with lock:
+            await self.coordinator.ensure_command_gap(self._serial)
             _LOGGER.info(
                 "Turning ON fan %s (serial=%s, smap=0x%X)",
                 self._name, self._serial, self._smap,
@@ -146,6 +147,7 @@ class SmarteefiFan(CoordinatorEntity, FanEntity):
         """Turn the fan off via UDP, serialized per module."""
         lock = self.coordinator.get_serial_lock(self._serial)
         async with lock:
+            await self.coordinator.ensure_command_gap(self._serial)
             _LOGGER.info(
                 "Turning OFF fan %s (serial=%s, smap=0x%X)",
                 self._name, self._serial, self._smap,
@@ -171,6 +173,7 @@ class SmarteefiFan(CoordinatorEntity, FanEntity):
         if speed:
             lock = self.coordinator.get_serial_lock(self._serial)
             async with lock:
+                await self.coordinator.ensure_command_gap(self._serial)
                 resp = await udp_protocol.async_set_speed(
                     self._serial, self.coordinator.broadcast_addr, self._smap, speed
                 )

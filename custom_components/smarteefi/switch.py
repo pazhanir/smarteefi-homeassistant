@@ -75,6 +75,7 @@ class SmarteefiSwitch(CoordinatorEntity, SwitchEntity):
         """Turn the switch on via UDP, serialized per module."""
         lock = self.coordinator.get_serial_lock(self._serial)
         async with lock:
+            await self.coordinator.ensure_command_gap(self._serial)
             _LOGGER.info(
                 "Turning ON switch %s (serial=%s, smap=0x%X)",
                 self._name, self._serial, self._smap,
@@ -101,6 +102,7 @@ class SmarteefiSwitch(CoordinatorEntity, SwitchEntity):
         """Turn the switch off via UDP, serialized per module."""
         lock = self.coordinator.get_serial_lock(self._serial)
         async with lock:
+            await self.coordinator.ensure_command_gap(self._serial)
             _LOGGER.info(
                 "Turning OFF switch %s (serial=%s, smap=0x%X)",
                 self._name, self._serial, self._smap,

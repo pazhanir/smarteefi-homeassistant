@@ -127,6 +127,7 @@ class SmarteefiLight(CoordinatorEntity, LightEntity):
         """Turn the light on with optional brightness and color control, serialized per module."""
         lock = self.coordinator.get_serial_lock(self._serial)
         async with lock:
+            await self.coordinator.ensure_command_gap(self._serial)
             _LOGGER.info(
                 "Turning ON light %s (serial=%s, smap=0x%X)",
                 self._name, self._serial, self._smap,
@@ -179,6 +180,7 @@ class SmarteefiLight(CoordinatorEntity, LightEntity):
         """Turn the light off via UDP, serialized per module."""
         lock = self.coordinator.get_serial_lock(self._serial)
         async with lock:
+            await self.coordinator.ensure_command_gap(self._serial)
             _LOGGER.info(
                 "Turning OFF light %s (serial=%s, smap=0x%X)",
                 self._name, self._serial, self._smap,

@@ -22,6 +22,12 @@ _LOGGER = logging.getLogger(__name__)
 # This prevents a stale poll from overwriting a fresh command response.
 COMMAND_STALENESS_WINDOW = 3.0
 
+# Minimum delay (seconds) between consecutive UDP commands to the same device module.
+# ESP32 devices drop commands that arrive too quickly after the previous one.
+# This fixes the combined switch bug where toggling a group sends two commands
+# back-to-back and the device only processes the first one.
+INTER_COMMAND_DELAY = 0.2
+
 PLATFORMS = ["switch", "fan", "light", "cover"]
 
 
@@ -53,8 +59,9 @@ async def async_setup(hass: HomeAssistant, config: dict):
 class SmarteefiCoordinator(DataUpdateCoordinator):
     """Smarteefi data update coordinator.
 
-    Polls all modules via UDP get-status on an interval (5s initially, then 15s).
+    Polls all modules via UDP get-status on an interval (5s initially, then 5s regular).
     Push updates from port 8890 are merged in via async_set_updated_data().
+    Inter-command delays prevent devices from dropping back-to-back commands.
     """
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, broadcast_addr: str):
@@ -121,6 +128,25 @@ class SmarteefiCoordinator(DataUpdateCoordinator):
         if last_time is None:
             return False
         return (time.monotonic() - last_time) < COMMAND_STALENESS_WINDOW
+
+    async def ensure_command_gap(self, serial: str) -> None:
+        """Ensure a minimum inter-command delay for a device module.
+
+        Call this at the start of every locked command section. If another
+        command was sent to the same serial within INTER_COMMAND_DELAY seconds,
+        this sleeps for the remaining time. Single commands have zero delay;
+        only back-to-back commands are throttled.
+        """
+        last_time = self._last_command_time.get(serial)
+        if last_time is not None:
+            elapsed = time.monotonic() - last_time
+            remaining = INTER_COMMAND_DELAY - elapsed
+            if remaining > 0:
+                _LOGGER.debug(
+                    "Inter-command delay for %s: sleeping %.0fms",
+                    serial, remaining * 1000,
+                )
+                await asyncio.sleep(remaining)
 
     async def _async_update_data(self) -> dict:
         """Poll all modules via UDP get-status with retry + ESP32 fallback."""

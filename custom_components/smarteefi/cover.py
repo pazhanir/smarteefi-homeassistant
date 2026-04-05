@@ -87,6 +87,7 @@ class SmarteefiCover(CoordinatorEntity, CoverEntity):
         """Open the cover via UDP, serialized per module."""
         lock = self.coordinator.get_serial_lock(self._serial)
         async with lock:
+            await self.coordinator.ensure_command_gap(self._serial)
             _LOGGER.info(
                 "Opening cover %s (serial=%s, smap=0x%X)",
                 self._name, self._serial, self._smap,
@@ -108,6 +109,7 @@ class SmarteefiCover(CoordinatorEntity, CoverEntity):
         """Close the cover via UDP, serialized per module."""
         lock = self.coordinator.get_serial_lock(self._serial)
         async with lock:
+            await self.coordinator.ensure_command_gap(self._serial)
             _LOGGER.info(
                 "Closing cover %s (serial=%s, smap=0x%X)",
                 self._name, self._serial, self._smap,
@@ -138,6 +140,7 @@ class SmarteefiCover(CoordinatorEntity, CoverEntity):
             # Partial position: determine direction based on current state
             lock = self.coordinator.get_serial_lock(self._serial)
             async with lock:
+                await self.coordinator.ensure_command_gap(self._serial)
                 current_pos = self.current_cover_position
                 turn_on = position > current_pos
                 resp = await udp_protocol.async_set_status(
