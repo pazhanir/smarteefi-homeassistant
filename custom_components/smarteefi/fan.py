@@ -119,46 +119,66 @@ class SmarteefiFan(CoordinatorEntity, FanEntity):
         return 0
 
     async def async_turn_on(self, percentage: int | None = None, preset_mode: str | None = None, **kwargs) -> None:
-        """Turn the fan on via UDP."""
-        _LOGGER.info("Turning ON fan %s (serial=%s, smap=%d)", self._name, self._serial, self._smap)
-        resp = await udp_protocol.async_set_status(
-            self._serial, self.coordinator.broadcast_addr, self._smap, True
-        )
-        if resp and resp.get("result") == 1:
-            self._update_coordinator_from_response(resp)
-        else:
-            _LOGGER.warning("set-status ON failed for fan %s", self._name)
-            await self.coordinator.async_request_refresh()
+        """Turn the fan on via UDP, serialized per module."""
+        lock = self.coordinator.get_serial_lock(self._serial)
+        async with lock:
+            _LOGGER.info(
+                "Turning ON fan %s (serial=%s, smap=0x%X)",
+                self._name, self._serial, self._smap,
+            )
+            resp = await udp_protocol.async_set_status(
+                self._serial, self.coordinator.broadcast_addr, self._smap, True
+            )
+            if resp and resp.get("result") == 1:
+                _LOGGER.debug(
+                    "ON response for fan %s: switchmap=0x%X, statusmap=0x%X",
+                    self._name, resp.get("switchmap", 0), resp.get("statusmap", 0),
+                )
+                self._update_coordinator_from_response(resp)
+            else:
+                _LOGGER.warning("set-status ON failed for fan %s (resp=%s)", self._name, resp)
+                await self.coordinator.async_request_refresh()
 
         if percentage is not None:
             await self.async_set_percentage(percentage)
 
     async def async_turn_off(self, **kwargs) -> None:
-        """Turn the fan off via UDP."""
-        _LOGGER.info("Turning OFF fan %s (serial=%s, smap=%d)", self._name, self._serial, self._smap)
-        resp = await udp_protocol.async_set_status(
-            self._serial, self.coordinator.broadcast_addr, self._smap, False
-        )
-        if resp and resp.get("result") == 1:
-            self._update_coordinator_from_response(resp)
-        else:
-            _LOGGER.warning("set-status OFF failed for fan %s", self._name)
-            await self.coordinator.async_request_refresh()
+        """Turn the fan off via UDP, serialized per module."""
+        lock = self.coordinator.get_serial_lock(self._serial)
+        async with lock:
+            _LOGGER.info(
+                "Turning OFF fan %s (serial=%s, smap=0x%X)",
+                self._name, self._serial, self._smap,
+            )
+            resp = await udp_protocol.async_set_status(
+                self._serial, self.coordinator.broadcast_addr, self._smap, False
+            )
+            if resp and resp.get("result") == 1:
+                _LOGGER.debug(
+                    "OFF response for fan %s: switchmap=0x%X, statusmap=0x%X",
+                    self._name, resp.get("switchmap", 0), resp.get("statusmap", 0),
+                )
+                self._update_coordinator_from_response(resp)
+            else:
+                _LOGGER.warning("set-status OFF failed for fan %s (resp=%s)", self._name, resp)
+                await self.coordinator.async_request_refresh()
 
     async def async_set_percentage(self, percentage: int) -> None:
-        """Set the fan speed via UDP."""
+        """Set the fan speed via UDP, serialized per module."""
         speed = math.ceil(percentage_to_ranged_value(SPEED_RANGE, percentage))
         _LOGGER.info("Setting fan %s speed to %d (percentage=%d)", self._name, speed, percentage)
 
         if speed:
-            resp = await udp_protocol.async_set_speed(
-                self._serial, self.coordinator.broadcast_addr, self._smap, speed
-            )
-            if resp and resp.get("result") == 1:
-                self._update_coordinator_from_response(resp)
-            else:
-                _LOGGER.warning("set-speed failed for fan %s", self._name)
-                await self.coordinator.async_request_refresh()
+            lock = self.coordinator.get_serial_lock(self._serial)
+            async with lock:
+                resp = await udp_protocol.async_set_speed(
+                    self._serial, self.coordinator.broadcast_addr, self._smap, speed
+                )
+                if resp and resp.get("result") == 1:
+                    self._update_coordinator_from_response(resp)
+                else:
+                    _LOGGER.warning("set-speed failed for fan %s (resp=%s)", self._name, resp)
+                    await self.coordinator.async_request_refresh()
         else:
             # Speed 0 = turn off
             await self.async_turn_off()
@@ -171,4 +191,6 @@ class SmarteefiFan(CoordinatorEntity, FanEntity):
         module["switchmap"] = resp.get("switchmap", module.get("switchmap", 0))
         module["available"] = True
         new_data[self._serial] = module
+        # Mark command time so the next poll doesn't overwrite this fresh data
+        self.coordinator.mark_command_time(self._serial)
         self.coordinator.async_set_updated_data(new_data)

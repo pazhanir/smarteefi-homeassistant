@@ -72,34 +72,56 @@ class SmarteefiSwitch(CoordinatorEntity, SwitchEntity):
         return (statusmap & self._smap) != 0
 
     async def async_turn_on(self, **kwargs):
-        """Turn the switch on via UDP."""
-        _LOGGER.info(
-            "Turning ON switch %s (serial=%s, smap=%d)",
-            self._name, self._serial, self._smap,
-        )
-        resp = await udp_protocol.async_set_status(
-            self._serial, self.coordinator.broadcast_addr, self._smap, True
-        )
-        if resp and resp.get("result") == 1:
-            self._update_coordinator_from_response(resp)
-        else:
-            _LOGGER.warning("set-status ON failed for %s, scheduling refresh", self._name)
-            await self.coordinator.async_request_refresh()
+        """Turn the switch on via UDP, serialized per module."""
+        lock = self.coordinator.get_serial_lock(self._serial)
+        async with lock:
+            _LOGGER.info(
+                "Turning ON switch %s (serial=%s, smap=0x%X)",
+                self._name, self._serial, self._smap,
+            )
+            resp = await udp_protocol.async_set_status(
+                self._serial, self.coordinator.broadcast_addr, self._smap, True
+            )
+            if resp and resp.get("result") == 1:
+                _LOGGER.debug(
+                    "ON response for %s: switchmap=0x%X, statusmap=0x%X",
+                    self._name,
+                    resp.get("switchmap", 0),
+                    resp.get("statusmap", 0),
+                )
+                self._update_coordinator_from_response(resp)
+            else:
+                _LOGGER.warning(
+                    "set-status ON failed for %s (resp=%s), scheduling refresh",
+                    self._name, resp,
+                )
+                await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs):
-        """Turn the switch off via UDP."""
-        _LOGGER.info(
-            "Turning OFF switch %s (serial=%s, smap=%d)",
-            self._name, self._serial, self._smap,
-        )
-        resp = await udp_protocol.async_set_status(
-            self._serial, self.coordinator.broadcast_addr, self._smap, False
-        )
-        if resp and resp.get("result") == 1:
-            self._update_coordinator_from_response(resp)
-        else:
-            _LOGGER.warning("set-status OFF failed for %s, scheduling refresh", self._name)
-            await self.coordinator.async_request_refresh()
+        """Turn the switch off via UDP, serialized per module."""
+        lock = self.coordinator.get_serial_lock(self._serial)
+        async with lock:
+            _LOGGER.info(
+                "Turning OFF switch %s (serial=%s, smap=0x%X)",
+                self._name, self._serial, self._smap,
+            )
+            resp = await udp_protocol.async_set_status(
+                self._serial, self.coordinator.broadcast_addr, self._smap, False
+            )
+            if resp and resp.get("result") == 1:
+                _LOGGER.debug(
+                    "OFF response for %s: switchmap=0x%X, statusmap=0x%X",
+                    self._name,
+                    resp.get("switchmap", 0),
+                    resp.get("statusmap", 0),
+                )
+                self._update_coordinator_from_response(resp)
+            else:
+                _LOGGER.warning(
+                    "set-status OFF failed for %s (resp=%s), scheduling refresh",
+                    self._name, resp,
+                )
+                await self.coordinator.async_request_refresh()
 
     def _update_coordinator_from_response(self, resp):
         """Merge a UDP command response into coordinator data."""
@@ -109,4 +131,6 @@ class SmarteefiSwitch(CoordinatorEntity, SwitchEntity):
         module["switchmap"] = resp.get("switchmap", module.get("switchmap", 0))
         module["available"] = True
         new_data[self._serial] = module
+        # Mark command time so the next poll doesn't overwrite this fresh data
+        self.coordinator.mark_command_time(self._serial)
         self.coordinator.async_set_updated_data(new_data)

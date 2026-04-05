@@ -317,11 +317,30 @@ async def async_set_status(
 ) -> Optional[dict]:
     """
     Send set-status to turn a channel ON or OFF.
+
+    Protocol: switch_map selects which channels to affect, status_value sets
+    those channels to on (=switch_map) or off (=0). Other channels are untouched.
+
     Returns parsed response dict on success, or None.
     """
     status_value = switch_map if turn_on else 0
+    _LOGGER.debug(
+        "async_set_status: serial=%s, switch_map=0x%X, status_value=0x%X, turn_on=%s",
+        serial, switch_map, status_value, turn_on,
+    )
     packet = build_set_status(serial, switch_map, status_value)
-    return await async_send_and_receive(packet, broadcast_addr, timeout)
+    resp = await async_send_and_receive(packet, broadcast_addr, timeout)
+    if resp:
+        _LOGGER.debug(
+            "async_set_status response: serial=%s, result=%s, switchmap=0x%X, statusmap=0x%X",
+            resp.get("serial", "?"),
+            resp.get("result", "?"),
+            resp.get("switchmap", 0),
+            resp.get("statusmap", 0),
+        )
+    else:
+        _LOGGER.debug("async_set_status: no response for serial=%s", serial)
+    return resp
 
 
 async def async_set_speed(

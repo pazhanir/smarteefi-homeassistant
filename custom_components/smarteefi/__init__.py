@@ -3,6 +3,7 @@
 import logging
 import asyncio
 import socket
+import time
 from datetime import timedelta
 
 import aiohttp
@@ -16,6 +17,10 @@ from .const import DOMAIN, SYNC_INTERVAL, INITIAL_SYNC_INTERVAL, API_LOGIN_URL, 
 from . import udp_protocol
 
 _LOGGER = logging.getLogger(__name__)
+
+# How long (seconds) after a command before we skip poll updates for that serial.
+# This prevents a stale poll from overwriting a fresh command response.
+COMMAND_STALENESS_WINDOW = 3.0
 
 PLATFORMS = ["switch", "fan", "light", "cover"]
 
@@ -68,6 +73,15 @@ class SmarteefiCoordinator(DataUpdateCoordinator):
         self._fallback_enabled = entry.data.get("fallback_enabled", False)
         self._fallback_ip = entry.data.get("fallback_ip", "")
 
+        # Per-serial asyncio locks to serialize commands to the same device module.
+        # This prevents race conditions when multiple channels on the same module
+        # are toggled in quick succession.
+        self._serial_locks: dict[str, asyncio.Lock] = {}
+
+        # Track last command time per serial so polling can skip stale updates.
+        # Key: serial, Value: monotonic timestamp of last successful command response.
+        self._last_command_time: dict[str, float] = {}
+
         # Build module map: serial -> combined switchmap for get-status
         self._modules: dict[str, int] = {}
         for device in entry.data.get("devices", []):
@@ -79,6 +93,10 @@ class SmarteefiCoordinator(DataUpdateCoordinator):
             else:
                 self._modules[serial] = smap
 
+        # Pre-create locks for known modules
+        for serial in self._modules:
+            self._serial_locks[serial] = asyncio.Lock()
+
         _LOGGER.debug(
             "Coordinator init: broadcast=%s, modules=%s, fallback=%s (ip=%s)",
             broadcast_addr,
@@ -86,6 +104,23 @@ class SmarteefiCoordinator(DataUpdateCoordinator):
             self._fallback_enabled,
             self._fallback_ip,
         )
+
+    def get_serial_lock(self, serial: str) -> asyncio.Lock:
+        """Get or create the asyncio Lock for a given module serial."""
+        if serial not in self._serial_locks:
+            self._serial_locks[serial] = asyncio.Lock()
+        return self._serial_locks[serial]
+
+    def mark_command_time(self, serial: str) -> None:
+        """Record that a command response was just processed for this serial."""
+        self._last_command_time[serial] = time.monotonic()
+
+    def _is_recently_commanded(self, serial: str) -> bool:
+        """Check if a command was processed recently for this serial."""
+        last_time = self._last_command_time.get(serial)
+        if last_time is None:
+            return False
+        return (time.monotonic() - last_time) < COMMAND_STALENESS_WINDOW
 
     async def _async_update_data(self) -> dict:
         """Poll all modules via UDP get-status with retry + ESP32 fallback."""
@@ -99,6 +134,18 @@ class SmarteefiCoordinator(DataUpdateCoordinator):
         data: dict = dict(self.data) if self.data else {}
 
         for serial, combined_switchmap in self._modules.items():
+            # Skip polling if a command was just processed for this serial.
+            # The command response already has the freshest state; polling now
+            # risks overwriting it with stale data if the device hasn't fully
+            # settled yet.
+            if self._is_recently_commanded(serial):
+                _LOGGER.debug(
+                    "Skipping poll for %s — command processed recently (%.1fs ago)",
+                    serial,
+                    time.monotonic() - self._last_command_time.get(serial, 0),
+                )
+                continue
+
             _LOGGER.debug("Polling %s (switchmap=0x%X)", serial, combined_switchmap)
 
             # --- First attempt ---

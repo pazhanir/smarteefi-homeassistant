@@ -124,59 +124,77 @@ class SmarteefiLight(CoordinatorEntity, LightEntity):
         return self._rgb_color
 
     async def async_turn_on(self, **kwargs):
-        """Turn the light on with optional brightness and color control."""
-        _LOGGER.info("Turning ON light %s (serial=%s, smap=%d)", self._name, self._serial, self._smap)
-
-        brightness = kwargs.get(ATTR_BRIGHTNESS, self._brightness)
-        rgb_color = kwargs.get(ATTR_RGB_COLOR, self._rgb_color)
-        r, g, b = rgb_color
-
-        if r or g or b:
-            # Set RGB color
-            resp = await udp_protocol.async_set_rgb_color(
-                self._serial, self.coordinator.broadcast_addr, self._smap, r, g, b
+        """Turn the light on with optional brightness and color control, serialized per module."""
+        lock = self.coordinator.get_serial_lock(self._serial)
+        async with lock:
+            _LOGGER.info(
+                "Turning ON light %s (serial=%s, smap=0x%X)",
+                self._name, self._serial, self._smap,
             )
-            if resp and resp.get("result") == 1:
-                self._rgb_color = rgb_color
-                self._update_coordinator_from_response(resp)
+
+            brightness = kwargs.get(ATTR_BRIGHTNESS, self._brightness)
+            rgb_color = kwargs.get(ATTR_RGB_COLOR, self._rgb_color)
+            r, g, b = rgb_color
+
+            if r or g or b:
+                # Set RGB color
+                resp = await udp_protocol.async_set_rgb_color(
+                    self._serial, self.coordinator.broadcast_addr, self._smap, r, g, b
+                )
+                if resp and resp.get("result") == 1:
+                    _LOGGER.debug(
+                        "RGB response for light %s: switchmap=0x%X, statusmap=0x%X",
+                        self._name, resp.get("switchmap", 0), resp.get("statusmap", 0),
+                    )
+                    self._rgb_color = rgb_color
+                    self._update_coordinator_from_response(resp)
+                else:
+                    _LOGGER.warning("set-rgb-color failed for light %s (resp=%s)", self._name, resp)
+                    await self.coordinator.async_request_refresh()
             else:
-                _LOGGER.warning("set-rgb-color failed for light %s", self._name)
-                await self.coordinator.async_request_refresh()
-        else:
-            # RGB is (0,0,0) — turn off instead
+                # RGB is (0,0,0) — turn off instead
+                resp = await udp_protocol.async_set_status(
+                    self._serial, self.coordinator.broadcast_addr, self._smap, False
+                )
+                if resp and resp.get("result") == 1:
+                    self._update_coordinator_from_response(resp)
+                else:
+                    await self.coordinator.async_request_refresh()
+                return
+
+            # Set intensity (brightness 0-255 -> 0-100)
+            intensity = self._brightness_to_intensity(brightness)
+            if intensity:
+                resp = await udp_protocol.async_set_intensity(
+                    self._serial, self.coordinator.broadcast_addr, self._smap, intensity
+                )
+                if resp and resp.get("result") == 1:
+                    self._brightness = brightness
+                    self._update_coordinator_from_response(resp)
+                else:
+                    _LOGGER.warning("set-intensity failed for light %s (resp=%s)", self._name, resp)
+                    await self.coordinator.async_request_refresh()
+
+    async def async_turn_off(self, **kwargs):
+        """Turn the light off via UDP, serialized per module."""
+        lock = self.coordinator.get_serial_lock(self._serial)
+        async with lock:
+            _LOGGER.info(
+                "Turning OFF light %s (serial=%s, smap=0x%X)",
+                self._name, self._serial, self._smap,
+            )
             resp = await udp_protocol.async_set_status(
                 self._serial, self.coordinator.broadcast_addr, self._smap, False
             )
             if resp and resp.get("result") == 1:
+                _LOGGER.debug(
+                    "OFF response for light %s: switchmap=0x%X, statusmap=0x%X",
+                    self._name, resp.get("switchmap", 0), resp.get("statusmap", 0),
+                )
                 self._update_coordinator_from_response(resp)
             else:
+                _LOGGER.warning("set-status OFF failed for light %s (resp=%s)", self._name, resp)
                 await self.coordinator.async_request_refresh()
-            return
-
-        # Set intensity (brightness 0-255 → 0-100)
-        intensity = self._brightness_to_intensity(brightness)
-        if intensity:
-            resp = await udp_protocol.async_set_intensity(
-                self._serial, self.coordinator.broadcast_addr, self._smap, intensity
-            )
-            if resp and resp.get("result") == 1:
-                self._brightness = brightness
-                self._update_coordinator_from_response(resp)
-            else:
-                _LOGGER.warning("set-intensity failed for light %s", self._name)
-                await self.coordinator.async_request_refresh()
-
-    async def async_turn_off(self, **kwargs):
-        """Turn the light off via UDP."""
-        _LOGGER.info("Turning OFF light %s (serial=%s, smap=%d)", self._name, self._serial, self._smap)
-        resp = await udp_protocol.async_set_status(
-            self._serial, self.coordinator.broadcast_addr, self._smap, False
-        )
-        if resp and resp.get("result") == 1:
-            self._update_coordinator_from_response(resp)
-        else:
-            _LOGGER.warning("set-status OFF failed for light %s", self._name)
-            await self.coordinator.async_request_refresh()
 
     def _update_coordinator_from_response(self, resp):
         """Merge a UDP command response into coordinator data."""
@@ -186,6 +204,8 @@ class SmarteefiLight(CoordinatorEntity, LightEntity):
         module["switchmap"] = resp.get("switchmap", module.get("switchmap", 0))
         module["available"] = True
         new_data[self._serial] = module
+        # Mark command time so the next poll doesn't overwrite this fresh data
+        self.coordinator.mark_command_time(self._serial)
         self.coordinator.async_set_updated_data(new_data)
 
     @staticmethod
