@@ -1,102 +1,183 @@
 import logging
 import aiohttp
-import os
-import stat
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
-from .const import DOMAIN, ARCH, OS
+from .const import DOMAIN, API_LOGIN_URL, API_DEVICES_URL
 
 _LOGGER = logging.getLogger(__name__)
 
-API_URL = "https://www.smarteefi.com/api/homeassistant_v1/user/validatehatoken"
+DEVICE_TYPES = ["switch", "fan", "light", "cover"]
+
 
 class SmarteefiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Smarteefi IoT Platform."""
 
     VERSION = 1
 
-    async def async_step_user(self, user_input=None):
-        """Prompt user to enter apitoken."""
-        errors = {}  # Reinitialize errors dictionary
+    def __init__(self):
+        """Initialize the config flow."""
+        self._data = {}
+        self._devices_raw = []
 
-        # Get correct integration path
-        INTEGRATION_PATH = self.hass.config.path(f"custom_components/smarteefi")
-    
-        # Full path to HACLI binary
-        if(OS=='win'):
-            HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli.exe")
-        else:
-            HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli")
-    
-        self.set_executable_permissions(HACLI)
-        _LOGGER.debug(f"Using HACLI path: {HACLI}")            
+    async def async_step_user(self, user_input=None):
+        """Step 1: Prompt user for email and password, login via v3 API."""
+        errors = {}
 
         if user_input is not None:
-            apitoken = user_input["apitoken"]
+            email = user_input["email"]
+            password = user_input["password"]
 
-            # Validate the API token
-            validation_result = await self._validate_api_token(apitoken)
-            if validation_result.get("result") != "success":
-                _LOGGER.error(f"Validation Result: {validation_result}")
-                myerror = validation_result.get("error_desc", "invalid_token")
-                _LOGGER.error(f"API token validation failed myerror: {myerror}")
-                errors["base"] = validation_result.get("error_desc", "invalid_token")  # Update errors with new error
-                _LOGGER.error(f"API token validation failed: {errors['base']}")
+            result = await self._api_login(email, password)
+
+            if result.get("result") == "success":
+                self._data["email"] = email
+                self._data["password"] = password
+                self._data["access_token"] = result["access_token"]
+                return await self.async_step_devices()
             else:
-                # Store apitoken and set network_interface, ip_address, and netmask to empty strings
-                return self.async_create_entry(
-                    title=DOMAIN, 
-                    data={
-                        "apitoken": apitoken,
-                        "network_interface": "",
-                        "ip_address": "",
-                        "netmask": "",
-                    }
-                )
+                error_desc = result.get("error_desc", "invalid_credentials")
+                _LOGGER.error("Smarteefi login failed: %s", error_desc)
+                errors["base"] = "invalid_credentials"
 
-        # Show form for entering apitoken
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({
-                vol.Required("apitoken"): str,
+                vol.Required("email"): str,
+                vol.Required("password"): str,
             }),
-            errors=errors,  # Pass the updated errors dictionary
+            errors=errors,
         )
-    
-    def set_executable_permissions(self, file_path: str) -> None:
-        """Set executable permissions on the specified file."""
-        if os.path.exists(file_path):
-            # Get current permissions
-            current_perms = os.stat(file_path).st_mode
-            # Add execute permission for owner, group, and others (equivalent to chmod +x)
-            os.chmod(file_path, current_perms | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        else:
-            # Log an error if the file isn’t found (optional, requires hass.logger)
-            _LOGGER(f"CLI not found at {file_path}")
 
-    async def _validate_api_token(self, apitoken):
-        """Validate the API token by making a POST request to the cloud API."""
+    async def async_step_devices(self, user_input=None):
+        """Step 2: Fetch devices and let user select type for each."""
+        errors = {}
+
+        if user_input is not None:
+            # Build device list from user selections
+            devices = []
+            for key, device_type in user_input.items():
+                # Key format: type_SERIAL_GROUPID_MAP
+                parts = key.split("_", 1)  # Split off "type_" prefix
+                if len(parts) != 2:
+                    continue
+                device_key = parts[1]  # SERIAL_GROUPID_MAP
+                # Find matching raw device
+                for raw in self._devices_raw:
+                    raw_key = f"{raw['serial']}_{raw['group_id']}_{raw['map']}"
+                    if raw_key == device_key:
+                        device_id = f"{raw['serial']}:{raw['group_id']}:{int(raw['map'])}"
+                        devices.append({
+                            "id": device_id,
+                            "type": device_type,
+                            "name": raw["name"],
+                            "cloudid": "",
+                        })
+                        break
+
+            return self.async_create_entry(
+                title=DOMAIN,
+                data={
+                    "email": self._data["email"],
+                    "password": self._data["password"],
+                    "access_token": self._data["access_token"],
+                    "network_interface": "",
+                    "ip_address": "",
+                    "netmask": "",
+                    "devices": devices,
+                },
+            )
+
+        # Fetch devices from v3 API
+        result = await self._api_fetch_devices(self._data["access_token"])
+
+        if result.get("result") != "success":
+            _LOGGER.error("Failed to fetch devices: %s", result)
+            errors["base"] = "api_error"
+            return self.async_show_form(
+                step_id="user",
+                data_schema=vol.Schema({
+                    vol.Required("email"): str,
+                    vol.Required("password"): str,
+                }),
+                errors=errors,
+            )
+
+        switches = result.get("switches", [])
+        if not switches:
+            _LOGGER.warning("No devices found on Smarteefi account")
+            errors["base"] = "no_devices"
+            return self.async_show_form(
+                step_id="user",
+                data_schema=vol.Schema({
+                    vol.Required("email"): str,
+                    vol.Required("password"): str,
+                }),
+                errors=errors,
+            )
+
+        self._devices_raw = switches
+
+        # Build dynamic schema with one dropdown per device
+        schema_dict = {}
+        for sw in switches:
+            key = f"type_{sw['serial']}_{sw['group_id']}_{sw['map']}"
+            label = sw.get("name", sw["serial"])
+            schema_dict[vol.Required(key, default="switch", description={"suggested_value": "switch"})] = vol.In(
+                {t: t.capitalize() for t in DEVICE_TYPES}
+            )
+
+        return self.async_show_form(
+            step_id="devices",
+            data_schema=vol.Schema(schema_dict),
+            errors=errors,
+            description_placeholders={
+                "device_count": str(len(switches)),
+            },
+        )
+
+    async def _api_login(self, email, password):
+        """Login to Smarteefi v3 API."""
         payload = {
-            "UserDevice": {
-                "hatoken": apitoken
+            "LoginForm": {
+                "email": email,
+                "password": password,
+                "app": "smarteefi",
             }
         }
-        headers = {
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(API_URL, json=payload, headers=headers) as response:
+                async with session.post(API_LOGIN_URL, json=payload, headers=headers) as response:
                     if response.status == 200:
-                        data = await response.json()
-                        return data
+                        return await response.json()
                     else:
-                        _LOGGER.error(f"API request failed with status code: {response.status}")
-                        return {"result": "error", "error_desc": "API request failed"}
+                        _LOGGER.error("Login API returned status %s", response.status)
+                        return {"result": "error", "error_desc": "api_error"}
         except Exception as e:
-            _LOGGER.error(f"Exception occurred while validating API token: {e}")
+            _LOGGER.error("Exception during login: %s", e)
+            return {"result": "error", "error_desc": str(e)}
+
+    async def _api_fetch_devices(self, access_token):
+        """Fetch devices from Smarteefi v3 API."""
+        payload = {
+            "UserDevice": {
+                "access_token": access_token,
+            }
+        }
+        headers = {"Content-Type": "application/json"}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(API_DEVICES_URL, json=payload, headers=headers) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        _LOGGER.error("Devices API returned status %s", response.status)
+                        return {"result": "error", "error_desc": "api_error"}
+        except Exception as e:
+            _LOGGER.error("Exception during device fetch: %s", e)
             return {"result": "error", "error_desc": str(e)}
 
     @staticmethod
@@ -107,63 +188,172 @@ class SmarteefiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class SmarteefiOptionsFlowHandler(config_entries.OptionsFlow):
-    """Handle options flow for editing apitoken."""
+    """Handle options flow for re-entering credentials and re-selecting device types."""
 
     def __init__(self, config_entry):
         """Initialize options flow."""
         self.config_entry = config_entry
+        self._data = {}
+        self._devices_raw = []
 
     async def async_step_init(self, user_input=None):
-        """Allow user to update apitoken."""
-        errors = {}  # Reinitialize errors dictionary
+        """Step 1: Re-enter email and password."""
+        errors = {}
 
         if user_input is not None:
-            # Validate the API token
-            validation_result = await self._validate_api_token(user_input["apitoken"])
-            if validation_result.get("result") != "success":
-                errors["base"] = validation_result.get("error_desc", "invalid_token")  # Update errors with new error
-            else:
-                # Update config entry with new data
-                return self.async_create_entry(
-                    title="",
-                    data={
-                        "apitoken": user_input["apitoken"],
-                        "network_interface": self.config_entry.data["network_interface"],
-                        "ip_address": self.config_entry.data["ip_address"],
-                        "netmask": self.config_entry.data["netmask"],
-                    },
-                )
+            email = user_input["email"]
+            password = user_input["password"]
 
-        # Show form for updating apitoken
+            result = await self._api_login(email, password)
+
+            if result.get("result") == "success":
+                self._data["email"] = email
+                self._data["password"] = password
+                self._data["access_token"] = result["access_token"]
+                return await self.async_step_devices()
+            else:
+                error_desc = result.get("error_desc", "invalid_credentials")
+                _LOGGER.error("Smarteefi login failed during options: %s", error_desc)
+                errors["base"] = "invalid_credentials"
+
+        current_email = self.config_entry.data.get("email", "")
+
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema({
-                vol.Required("apitoken", default=self.config_entry.data["apitoken"]): str,
+                vol.Required("email", default=current_email): str,
+                vol.Required("password"): str,
             }),
-            errors=errors,  # Pass the updated errors dictionary
+            errors=errors,
         )
 
-    async def _validate_api_token(self, apitoken):
-        """Validate the API token by making a POST request to the cloud API."""
+    async def async_step_devices(self, user_input=None):
+        """Step 2: Re-fetch devices and let user re-select types."""
+        errors = {}
+
+        if user_input is not None:
+            # Build device list from user selections
+            devices = []
+            for key, device_type in user_input.items():
+                parts = key.split("_", 1)
+                if len(parts) != 2:
+                    continue
+                device_key = parts[1]
+                for raw in self._devices_raw:
+                    raw_key = f"{raw['serial']}_{raw['group_id']}_{raw['map']}"
+                    if raw_key == device_key:
+                        device_id = f"{raw['serial']}:{raw['group_id']}:{int(raw['map'])}"
+                        devices.append({
+                            "id": device_id,
+                            "type": device_type,
+                            "name": raw["name"],
+                            "cloudid": "",
+                        })
+                        break
+
+            # Update config entry with new credentials and devices
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                data={
+                    **self.config_entry.data,
+                    "email": self._data["email"],
+                    "password": self._data["password"],
+                    "access_token": self._data["access_token"],
+                    "devices": devices,
+                },
+            )
+
+            return self.async_create_entry(title="", data={})
+
+        # Fetch devices from v3 API
+        result = await self._api_fetch_devices(self._data["access_token"])
+
+        if result.get("result") != "success":
+            _LOGGER.error("Failed to fetch devices during options: %s", result)
+            errors["base"] = "api_error"
+            return self.async_show_form(
+                step_id="init",
+                data_schema=vol.Schema({
+                    vol.Required("email"): str,
+                    vol.Required("password"): str,
+                }),
+                errors=errors,
+            )
+
+        switches = result.get("switches", [])
+        if not switches:
+            _LOGGER.warning("No devices found during options flow")
+            errors["base"] = "no_devices"
+            return self.async_show_form(
+                step_id="init",
+                data_schema=vol.Schema({
+                    vol.Required("email"): str,
+                    vol.Required("password"): str,
+                }),
+                errors=errors,
+            )
+
+        self._devices_raw = switches
+
+        # Build existing type map from current config for defaults
+        current_devices = self.config_entry.data.get("devices", [])
+        current_type_map = {d["id"]: d["type"] for d in current_devices}
+
+        schema_dict = {}
+        for sw in switches:
+            key = f"type_{sw['serial']}_{sw['group_id']}_{sw['map']}"
+            device_id = f"{sw['serial']}:{sw['group_id']}:{int(sw['map'])}"
+            default_type = current_type_map.get(device_id, "switch")
+            schema_dict[vol.Required(key, default=default_type)] = vol.In(
+                {t: t.capitalize() for t in DEVICE_TYPES}
+            )
+
+        return self.async_show_form(
+            step_id="devices",
+            data_schema=vol.Schema(schema_dict),
+            errors=errors,
+        )
+
+    async def _api_login(self, email, password):
+        """Login to Smarteefi v3 API."""
         payload = {
-            "UserDevice": {
-                "hatoken": apitoken
+            "LoginForm": {
+                "email": email,
+                "password": password,
+                "app": "smarteefi",
             }
         }
-        headers = {
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(API_URL, json=payload, headers=headers) as response:
+                async with session.post(API_LOGIN_URL, json=payload, headers=headers) as response:
                     if response.status == 200:
-                        data = await response.json()
-                        return data
+                        return await response.json()
                     else:
-                        _LOGGER.error(f"API request failed with status code: {response.status}")
-                        return {"result": "error", "error_desc": "API request failed"}
+                        _LOGGER.error("Login API returned status %s", response.status)
+                        return {"result": "error", "error_desc": "api_error"}
         except Exception as e:
-            _LOGGER.error(f"Exception occurred while validating API token: {e}")
+            _LOGGER.error("Exception during login: %s", e)
             return {"result": "error", "error_desc": str(e)}
-        
+
+    async def _api_fetch_devices(self, access_token):
+        """Fetch devices from Smarteefi v3 API."""
+        payload = {
+            "UserDevice": {
+                "access_token": access_token,
+            }
+        }
+        headers = {"Content-Type": "application/json"}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(API_DEVICES_URL, json=payload, headers=headers) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        _LOGGER.error("Devices API returned status %s", response.status)
+                        return {"result": "error", "error_desc": "api_error"}
+        except Exception as e:
+            _LOGGER.error("Exception during device fetch: %s", e)
+            return {"result": "error", "error_desc": str(e)}

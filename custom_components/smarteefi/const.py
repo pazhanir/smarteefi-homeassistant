@@ -29,4 +29,8 @@ ARCH = arch
 OS=os
 
 INITIAL_SYNC_INTERVAL = 5 # Sync interval for the first sync after HA Restart
-SYNC_INTERVAL = 300 # Sync interval in seconds (5 minutes)
+SYNC_INTERVAL = 15 # Sync interval in seconds
+
+API_BASE_URL = "https://www.smarteefi.com/api/v3"
+API_LOGIN_URL = API_BASE_URL + "/user/login"
+API_DEVICES_URL = API_BASE_URL + "/user/devices"

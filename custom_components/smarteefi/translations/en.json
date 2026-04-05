@@ -2,9 +2,43 @@
   "config": {
     "step": {
       "user": {
-        "title": "Smarteefi Setup",
-        "description": "Enter your Smarteefi Home Assistant API Token\n\nYou may request home assistant api token from Smarteefi App Menu\nMenu->HomeAssistant"
+        "title": "Smarteefi Login",
+        "description": "Enter your Smarteefi account credentials",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "devices": {
+        "title": "Select Device Types",
+        "description": "Select the type for each discovered device. Found {device_count} device(s)."
       }
+    },
+    "error": {
+      "invalid_credentials": "Invalid email or password",
+      "api_error": "Unable to connect to Smarteefi API",
+      "no_devices": "No devices found on your account"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Smarteefi Login",
+        "description": "Re-enter your Smarteefi account credentials",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "devices": {
+        "title": "Select Device Types",
+        "description": "Select the type for each discovered device"
+      }
+    },
+    "error": {
+      "invalid_credentials": "Invalid email or password",
+      "api_error": "Unable to connect to Smarteefi API",
+      "no_devices": "No devices found on your account"
     }
   }
 }

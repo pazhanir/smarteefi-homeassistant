@@ -12,11 +12,9 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
-from .const import DOMAIN, ARCH, OS, SYNC_INTERVAL, INITIAL_SYNC_INTERVAL
+from .const import DOMAIN, ARCH, OS, SYNC_INTERVAL, INITIAL_SYNC_INTERVAL, API_LOGIN_URL, API_DEVICES_URL
 
 _LOGGER = logging.getLogger(__name__)
-
-API_URL = "https://www.smarteefi.com/api/homeassistant_v1/user/devices"
 
 async def async_setup(hass: HomeAssistant, config: dict):
     """Set up the Smarteefi integration."""
@@ -209,6 +207,19 @@ class SmarteefiDataUpdateCoordinator:
 
         # Final check after potential retry
         if error or (output and "device offline" in output.lower()):
+            # --- New Logic: Check ESP32 Webserver before marking unavailable ---
+            try:
+                session = async_get_clientsession(self.hass)
+                # Timeout set to 5 seconds
+                async with session.get("http://192.168.0.12", timeout=5) as response:
+                    if response.status == 200:
+                        _LOGGER.debug(f"Device {device['id']} CLI offline, but ESP32 Webserver (192.168.0.12) is reachable (200 OK). Ignoring offline status.")
+                        return  # Do nothing, exit function
+            except Exception as e:
+                # Includes asyncio.TimeoutError and aiohttp.ClientError
+                _LOGGER.debug(f"ESP32 Webserver check failed: {e}. Proceeding to mark device as unavailable.")
+            # -------------------------------------------------------------------
+
             _LOGGER.error(f"Device {device['id']} is offline after second attempt. Marking as unavailable. Error: {error or output}")
             dispatch_to_entities({"available": False})
         else:
@@ -317,10 +328,10 @@ async def start_udp_server(hass: HomeAssistant, ip_address: str, port: int):
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up Smarteefi integration from a config entry."""
     hass.data.setdefault(DOMAIN, {})
-    apitoken = entry.data.get("apitoken")
-    
-    if not apitoken:
-        _LOGGER.error("API token is missing in config entry")
+    access_token = entry.data.get("access_token")
+
+    if not access_token:
+        _LOGGER.error("Access token is missing in config entry")
         return False
 
     # Auto-detect the active interface, IP address, and netmask
@@ -342,7 +353,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     udp_transport = await start_udp_server(hass, ip_address, udp_port)
     if udp_transport is None:
         _LOGGER.warning("UDP server failed to start, continuing without real-time updates")
-    
+
     hass.data[DOMAIN]["udp_transport"] = udp_transport
 
     # Initialize data coordinator
@@ -352,14 +363,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     session = async_get_clientsession(hass)
 
-    if DOMAIN not in hass.data:
-        hass.data[DOMAIN] = {}
-
-    # Check if devices are already loaded in config_entry
+    # Check if devices are already loaded in config_entry (they should be from config_flow)
     if "devices" not in entry.data:
         try:
-            _LOGGER.debug("Fetching devices using API token: %s", apitoken)
-            devices = await fetch_devices(session, apitoken)
+            _LOGGER.debug("Fetching devices using access token")
+            devices = await fetch_devices(session, access_token)
             _LOGGER.debug("Devices fetched successfully: %s", devices)
 
             # Update config_entry with fetched devices
@@ -377,9 +385,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             _LOGGER.error("Error fetching Smarteefi devices: %s", e)
             return False
     else:
-        # Devices are already in config_entry, no need to fetch
+        # Devices are already in config_entry from config flow, no need to fetch
         await hass.config_entries.async_forward_entry_setups(entry, ["switch", "fan", "light", "cover"])
-    
+
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -430,12 +438,12 @@ def _get_active_interface_ip_and_netmask():
         _LOGGER.error(f"Error determining active interface: {e}")
         return None, None, None
 
-async def fetch_devices(session: aiohttp.ClientSession, apitoken: str):
-    """Fetch devices from Smarteefi API using POST request."""
-    payload = {"UserDevice": {"hatoken": apitoken}}
+async def fetch_devices(session: aiohttp.ClientSession, access_token: str):
+    """Fetch devices from Smarteefi v3 API and transform to existing format."""
+    payload = {"UserDevice": {"access_token": access_token}}
     headers = {"Content-Type": "application/json"}
 
-    async with session.post(API_URL, json=payload, headers=headers) as response:
+    async with session.post(API_DEVICES_URL, json=payload, headers=headers) as response:
         response_text = await response.text()
 
         if response.status != 200:
@@ -447,26 +455,60 @@ async def fetch_devices(session: aiohttp.ClientSession, apitoken: str):
             _LOGGER.error("API returned failure: %s", json_response)
             return []
 
-        return json_response.get("devices", [])
+        # Transform v3 switches[] to existing device format
+        switches = json_response.get("switches", [])
+        devices = []
+        for sw in switches:
+            device_id = f"{sw['serial']}:{sw['group_id']}:{int(sw['map'])}"
+            devices.append({
+                "id": device_id,
+                "type": "switch",  # Default type; config_flow lets user override
+                "name": sw.get("name", sw["serial"]),
+                "cloudid": "",
+            })
+        return devices
 
 async def async_refresh_devices(hass: HomeAssistant, entry: ConfigEntry):
-    """Refresh devices from Smarteefi API."""
+    """Refresh devices from Smarteefi v3 API, with re-login if token is stale."""
     session = async_get_clientsession(hass)
-    apitoken = entry.data.get("apitoken")
+    access_token = entry.data.get("access_token")
 
-    if not apitoken:
-        _LOGGER.error("API token is missing in config entry")
+    if not access_token:
+        _LOGGER.error("Access token is missing in config entry")
         return False
 
     try:
-        _LOGGER.debug("Refreshing devices using API token: %s", apitoken)
-        devices = await fetch_devices(session, apitoken)
+        _LOGGER.debug("Refreshing devices using access token")
+        devices = await fetch_devices(session, access_token)
+
+        # If fetch returned empty, try re-login with stored credentials
+        if not devices:
+            _LOGGER.warning("Device fetch returned empty, attempting re-login")
+            email = entry.data.get("email")
+            password = entry.data.get("password")
+            if email and password:
+                new_token = await _api_relogin(session, email, password)
+                if new_token:
+                    access_token = new_token
+                    # Update token in config entry
+                    hass.config_entries.async_update_entry(
+                        entry,
+                        data={**entry.data, "access_token": access_token}
+                    )
+                    devices = await fetch_devices(session, access_token)
+
         _LOGGER.debug("Devices refreshed successfully: %s", devices)
 
         # Get the current devices from the config entry
         current_devices = entry.data.get("devices", [])
         current_device_ids = {device['id'] for device in current_devices}
         new_device_ids = {device['id'] for device in devices}
+
+        # Preserve user-selected types for existing devices
+        current_type_map = {d["id"]: d["type"] for d in current_devices}
+        for device in devices:
+            if device["id"] in current_type_map:
+                device["type"] = current_type_map[device["id"]]
 
         # Identify removed and added devices
         removed_device_ids = current_device_ids - new_device_ids
@@ -498,6 +540,33 @@ async def async_refresh_devices(hass: HomeAssistant, entry: ConfigEntry):
     except Exception as e:
         _LOGGER.error("Error refreshing Smarteefi devices: %s", e)
         return False
+
+
+async def _api_relogin(session: aiohttp.ClientSession, email: str, password: str):
+    """Re-login to Smarteefi v3 API and return new access_token, or None on failure."""
+    payload = {
+        "LoginForm": {
+            "email": email,
+            "password": password,
+            "app": "smarteefi",
+        }
+    }
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        async with session.post(API_LOGIN_URL, json=payload, headers=headers) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get("result") == "success":
+                    _LOGGER.info("Re-login successful, new access token obtained")
+                    return data.get("access_token")
+                else:
+                    _LOGGER.error("Re-login failed: %s", data)
+            else:
+                _LOGGER.error("Re-login API returned status %s", response.status)
+    except Exception as e:
+        _LOGGER.error("Exception during re-login: %s", e)
+    return None
 
 def set_executable_permissions(file_path: str) -> None:
     """Set executable permissions on the specified file."""
